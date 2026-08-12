@@ -112,7 +112,12 @@ RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuse
 # Create directories including Ultralytics cache config. /app/.cache/huggingface
 # exists in-image (appuser-owned via the chown below) so a persistent volume
 # mounted there inherits writable ownership for the ASR model downloads.
-RUN mkdir -p /app/uploads /app/output /app/.cache/huggingface /tmp/Ultralytics
+#
+# /app/output/autopilot is here for the same reason: Docker seeds a named volume
+# from the image path it is mounted over, but creates that path root-owned if it
+# does not exist — and the app runs as appuser, so Autopilot's SQLite file then
+# fails to open with "unable to open database file".
+RUN mkdir -p /app/uploads /app/output /app/output/autopilot /app/.cache/huggingface /tmp/Ultralytics
 # Fix permissions: /app for code/uploads, /tmp/Ultralytics for AI cache
 RUN chown -R appuser:appuser /app /tmp/Ultralytics
 

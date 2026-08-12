@@ -12,7 +12,31 @@ services:
       - .:/app
       - /app/__pycache__
       - ./output:/app/output
+      # Autopilot's SQLite state. A named volume, NOT a path inside the image:
+      # the container filesystem is discarded on every rebuild, and losing this
+      # file means losing which sources were processed and which posts were
+      # already sent — i.e. duplicate processing and duplicate publishing after
+      # an update. Backed up by copying output/autopilot/autopilot.db*.
+      - autopilot-state:/app/output/autopilot
+    environment:
+      # One heavy pipeline at a time. Whisper + YOLO/MediaPipe + FFmpeg on an
+      # M1 will happily consume every core and all the RAM; running two jobs
+      # concurrently is how the machine locks up rather than how it goes faster.
+      # Autopilot enforces its own single-pipeline rule on top of this.
+      - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-1}
+      - AUTOPILOT_ENABLED=${AUTOPILOT_ENABLED:-1}
+      - AUTOPILOT_DB_PATH=/app/output/autopilot/autopilot.db
     restart: unless-stopped
+    healthcheck:
+      # Hits the detailed probe so an Autopilot database that will not open is
+      # visible as a degraded container, not just as a quiet feature outage.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,json,sys; d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health/detail', timeout=5)); sys.exit(0 if d.get('status')=='ok' else 1)\""]
+      interval: 60s
+      timeout: 15s
+      # Model loading and the first yt-dlp warm-up make early boot slow; a short
+      # start_period would mark a perfectly healthy container as failed.
+      start_period: 180s
+      retries: 3
 
   frontend:
     build:
@@ -27,6 +51,12 @@ services:
     restart: unless-stopped
     depends_on:
       - backend
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5173/ >/dev/null 2>&1 || exit 1"]
+      interval: 60s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
 
   renderer:
     build:
@@ -44,3 +74,6 @@ services:
     restart: unless-stopped
     depends_on:
       - backend
+
+volumes:
+  autopilot-state:

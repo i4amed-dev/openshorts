@@ -14,7 +14,7 @@ const AuthContext = createContext(null);
 export const useAuth = () => useContext(AuthContext);
 
 export function AuthProvider({ children }) {
-  const [config, setConfig] = useState({ billingEnabled: false, googleAuthEnabled: false });
+  const [config, setConfig] = useState({ billingEnabled: false, googleAuthEnabled: false, autopilotEnabled: false });
   const [me, setMe] = useState(null);           // /api/me payload, or null when signed out
   const [loading, setLoading] = useState(true);
   const [signingIn, setSigningIn] = useState(false);
@@ -134,6 +134,7 @@ export function AuthProvider({ children }) {
   const value = {
     billingEnabled: config.billingEnabled,
     googleAuthEnabled: config.googleAuthEnabled,
+    autopilotEnabled: !!config.autopilotEnabled,
     loading,
     signingIn,
     user: me?.user || null,

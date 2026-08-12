@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  User LaunchAgent: bring the Klippo compose project up after login.
+
+  Why it exists: Docker Desktop's restart policy only revives containers it was
+  managing when it last exited. After a reboot into a fresh session the compose
+  project may never have been started, so `restart: unless-stopped` has nothing
+  to act on. This waits for the daemon, then runs `docker compose up -d`.
+
+  It is a LaunchAgent, not a LaunchDaemon: it runs as you, after you log in, with
+  no elevated privileges. That is also its limitation — see ops/macos/README.md
+  section 3 on what a cold boot into a FileVault login screen actually does.
+
+  Install:
+    sed -i '' "s#__KLIPPO_DIR__#$PWD#g" ops/macos/com.klippo.autopilot.plist
+    cp ops/macos/com.klippo.autopilot.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.klippo.autopilot.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.klippo.autopilot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-lc</string>
+        <!--
+          Wait up to 5 minutes for the Docker daemon: Docker Desktop takes a
+          while to start after login, and `compose up` against a dead socket
+          just fails. Then bring the project up idempotently — if it is already
+          running, this is a no-op.
+        -->
+        <string>
+          cd "__KLIPPO_DIR__" || exit 1;
+          for i in $(seq 1 60); do
+            if docker info >/dev/null 2>&amp;1; then break; fi;
+            sleep 5;
+          done;
+          if ! docker info >/dev/null 2>&amp;1; then
+            echo "$(date): Docker daemon never came up — giving up." >&amp;2;
+            exit 1;
+          fi;
+          echo "$(date): starting Klippo";
+          exec docker compose up -d
+        </string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      Deliberately NOT KeepAlive: this is a one-shot "bring it up" task, and the
+      containers' own `restart: unless-stopped` handles crashes. KeepAlive here
+      would relaunch `compose up` in a tight loop whenever it exits normally.
+    -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/klippo-autopilot.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/klippo-autopilot.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

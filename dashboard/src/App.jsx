@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download } from 'lucide-react';
+import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Rocket } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import ResultCard from './components/ResultCard';
@@ -17,6 +17,7 @@ import LoginModal from './components/LoginModal';
 import TrialGate from './components/TrialGate';
 import AdvancedBanner from './components/AdvancedBanner';
 import HistoryTab from './components/HistoryTab';
+import AutopilotTab from './components/AutopilotTab';
 import ProfileMenu from './components/ProfileMenu';
 import Modal from './components/ui/Modal';
 import { useAuth } from './contexts/AuthContext';
@@ -171,7 +172,7 @@ const pollJob = async (jobId) => {
 
 function App() {
   // Cloud auth/billing session (inert when billing is disabled).
-  const { billingEnabled, isManaged, isSignedIn, me, plan, refreshMe } = useAuth();
+  const { billingEnabled, autopilotEnabled, isManaged, isSignedIn, me, plan, refreshMe } = useAuth();
   const [showLogin, setShowLogin] = useState(false);
   const [showTopUp, setShowTopUp] = useState(false);
   const [showPlanChoice, setShowPlanChoice] = useState(false);
@@ -676,12 +677,15 @@ function App() {
   const Sidebar = () => {
     const navItems = [
       { id: 'dashboard', ord: '01', icon: LayoutDashboard, label: 'Clip Generator' },
-      { id: 'saasshorts', ord: '02', icon: Sparkles, label: 'AI Shorts', byok: true },
-      { id: 'ai-agent', ord: '03', icon: Bot, label: 'AI Agent', byok: true },
-      { id: 'ugc-gallery', ord: '04', icon: LayoutGrid, label: 'UGC Gallery' },
-      { id: 'thumbnails', ord: '05', icon: Image, label: 'YouTube Studio' },
-      ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '06', icon: History, label: 'History' }] : []),
-      { id: 'settings', ord: '07', icon: Settings, label: 'Settings' },
+      // Autopilot drives the Clip Generator unattended. It is a self-host
+      // feature: the backend only mounts its routes when billing is off.
+      ...(autopilotEnabled ? [{ id: 'autopilot', ord: '02', icon: Rocket, label: 'Autopilot' }] : []),
+      { id: 'saasshorts', ord: '03', icon: Sparkles, label: 'AI Shorts', byok: true },
+      { id: 'ai-agent', ord: '04', icon: Bot, label: 'AI Agent', byok: true },
+      { id: 'ugc-gallery', ord: '05', icon: LayoutGrid, label: 'UGC Gallery' },
+      { id: 'thumbnails', ord: '06', icon: Image, label: 'YouTube Studio' },
+      ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '07', icon: History, label: 'History' }] : []),
+      { id: 'settings', ord: '08', icon: Settings, label: 'Settings' },
     ];
 
     return (
@@ -1225,6 +1229,8 @@ function App() {
           )}
 
           {/* View: History */}
+          {activeTab === 'autopilot' && <AutopilotTab />}
+
           {activeTab === 'history' && (
             <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
               <div className="max-w-6xl mx-auto p-6 md:p-8">

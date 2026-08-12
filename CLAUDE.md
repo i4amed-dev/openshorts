@@ -55,10 +55,56 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 | `s3_uploader.py` | AWS S3 upload with caching |
 | `subtitles.py` | SRT generation, FFmpeg subtitle burning, and dubbed video transcription |
 | `translate.py` | ElevenLabs dubbing API for AI voice translation |
+| `publishing_service.py` | **The one** Upload-Post implementation — payload construction + streaming multipart upload. Used by `/api/social/post`, `/api/saasshorts/post` and Autopilot. Never build the payload anywhere else. |
+| `automation/` | Autopilot: the unattended content engine (see below) |
+| `ops/healthcheck.py` | Machine fitness check for a dedicated Autopilot Mac |
+| `ops/benchmark.py` | Memory/CPU/disk cost of one real source on this machine |
 | `dashboard/src/App.jsx` | Main React component with state management |
+| `dashboard/src/components/AutopilotTab.jsx` | Autopilot operations + setup UI |
 | `dashboard/src/components/TranslateModal.jsx` | Voice dubbing UI with language selection |
 | `dashboard/vite-plugin-seo.js` | Build-time SEO surface: injects crawler-visible homepage content, emits static pages, sitemap.xml and llms.txt |
 | `dashboard/seo/data.js` | Single source of truth for pricing, pipeline and competitor facts used by every generated page |
+
+### Autopilot (`automation/`)
+
+The unattended mode: discover YouTube sources → rank → submit to the **existing**
+Clip Generator → select clips → schedule → publish through the **existing**
+Upload-Post integration. Self-host only (off when `BILLING_ENABLED`).
+
+Rules that are load-bearing — breaking one reintroduces a class of bug:
+
+- **No second pipeline.** Video work goes through `app.submit_clip_job()`, the
+  same function `/api/process` calls. Publishing goes through
+  `publishing_service.publish()`. Autopilot decides *what*, never *how*.
+- **`automation/` imports with the standard library alone.** CI installs only
+  `pytest pillow httpx pydantic sqlalchemy`, and `app.py` pulls in boto3,
+  ultralytics, mediapipe and faster-whisper at import time. So `app.py` registers
+  adapters into `automation/ports.py` at startup; `automation/` never imports
+  `app`. Keep it that way or the whole test suite stops running in CI.
+- **State lives in SQLite, never only in a dict.** `automation/db.py`, WAL mode,
+  on a persistent volume. Deduplication is enforced by DB constraints (unique
+  `youtube_video_id`, unique `job_id`, unique `(job_id, clip_index)`, partial
+  unique indexes on live publish attempts and on slots), not by application
+  checks — a check has a read-then-write window a duplicate tick slips through.
+- **One heavy pipeline at a time**, enforced from Autopilot's own state so a
+  raised `MAX_CONCURRENT_JOBS` cannot melt the machine.
+- **Timezones**: store UTC, convert only at the boundary, validate the IANA name.
+- **`PublishState.UNCERTAIN` is never auto-retried.** Upload-Post has no
+  idempotency key, so retrying an ambiguous outcome can double-post. A human
+  resolves it. Do not "fix" this by adding a retry.
+- **Rights**: Autopilot carries a persistent Source Rights Policy and records it
+  with every processed source. It must never synthesise manual mode's
+  acknowledgement checkbox.
+
+Files: `db.py` (schema + repository), `models.py` (states + legal transitions),
+`config.py` (validation of everything the dashboard sends), `youtube_client.py`,
+`discovery.py`, `ranking.py`, `eligibility.py`, `scheduler.py` (slot maths),
+`publishing.py`, `orchestrator.py` (the state machine), `service.py` (loop,
+lease, dashboard view), `api.py`, `ports.py` (the seam to `app.py`).
+
+Ops: `ops/macos/` for always-on macOS setup. `ops/healthcheck.py` and
+`ops/benchmark.py` for the M1 deployment profile.
+
 
 ### SEO / AI-crawler surface
 
@@ -102,6 +148,13 @@ answers describe the paid product as free.
 | POST | `/api/translate` | AI voice dubbing via ElevenLabs |
 | GET | `/api/translate/languages` | List supported dubbing languages |
 | POST | `/api/social/post` | Post to social media (async upload) |
+| GET | `/health/detail` | Backend + Autopilot operational health (no credentials) |
+| GET | `/api/autopilot/status` | Full Autopilot dashboard payload |
+| GET/PUT | `/api/autopilot/settings` | Autopilot configuration (PUT accepts a partial patch) |
+| POST | `/api/autopilot/{enable,disable,pause,resume,emergency-stop}` | Engine controls |
+| POST | `/api/autopilot/{discover,process-next}` | Run a stage now |
+| POST | `/api/autopilot/sources/{id}/{skip,retry}` | Candidate actions |
+| POST | `/api/autopilot/publishes/{id}/{retry,force-retry,resolve}` | Publish-attempt actions |
 
 ### Concurrency Model
 Async job queue with semaphore-based concurrency control. Configure via `MAX_CONCURRENT_JOBS` env var (default: 5). Jobs auto-cleanup after 1 hour.
@@ -110,8 +163,11 @@ Async job queue with semaphore-based concurrency control. Configure via `MAX_CON
 
 **Server-side (.env):**
 - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_S3_BUCKET` - For S3 backup
-- `MAX_CONCURRENT_JOBS` - Concurrent processing limit (default: 5)
+- `MAX_CONCURRENT_JOBS` - Concurrent processing limit (default: 5; **1 on a laptop**)
 - `VITE_API_URL` - Production API URL override
+- `GEMINI_API_KEY`, `YOUTUBE_DATA_API_KEY`, `UPLOAD_POST_API_KEY`, `UPLOAD_POST_USER` -
+  required by Autopilot, which cannot read the browser's localStorage
+- `AUTOPILOT_ENABLED`, `AUTOPILOT_DB_PATH`, `AUTOPILOT_TICK_SECONDS`, `AUTOPILOT_LEASE_TTL`
 
 **Client-side (localStorage, encrypted):**
 - `GEMINI_API_KEY` - Google Gemini API key (required)

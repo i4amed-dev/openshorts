@@ -11,6 +11,10 @@ google-genai==1.75.0
 python-dotenv==1.2.2
 mediapipe==0.10.14
 boto3==1.43.4
+# Autopilot schedules in the operator's IANA timezone. zoneinfo falls back to
+# the OS tz database, which a slim base image is not obliged to ship — a missing
+# one would silently push every publishing slot to UTC. Pin it explicitly.
+tzdata==2026.1
 
 fastapi==0.136.1
 uvicorn==0.46.0

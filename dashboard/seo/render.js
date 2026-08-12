@@ -186,7 +186,7 @@ const NAV = `
   <a class="cta" href="${SITE.url}/">Get free clips</a>
 </div></header>`
 
-const footer = (related) => `
+const footer = () => `
 <footer class="site"><div class="wrap">
   <div class="row">
     <a href="${SITE.url}/">Klippo</a>
@@ -269,7 +269,7 @@ ${
 ${page.body}
 ${relatedBlock(related)}
 </div></main>
-${footer(related)}
+${footer()}
 </body>
 </html>`
 }

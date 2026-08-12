@@ -23,6 +23,7 @@ from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
+import publishing_service
 
 load_dotenv()
 
@@ -641,7 +642,7 @@ def _enforce_uploads_size_cap():
             pass
 
 
-def _enforce_output_size_cap():
+def _enforce_output_size_cap(protected: Optional[set] = None):
     """Delete the oldest job dirs while OUTPUT_DIR is over OUTPUT_MAX_GB."""
     cap = OUTPUT_MAX_GB * 1024 ** 3
     if cap <= 0:
@@ -650,9 +651,12 @@ def _enforce_output_size_cap():
     if used <= cap:
         return
     thumbs = os.path.basename(THUMBNAILS_DIR)
+    protected = protected or set()
     candidates = []
     for job_id in os.listdir(OUTPUT_DIR):
-        if job_id == thumbs:
+        # "autopilot" holds the SQLite state, not a job; the protected set holds
+        # clips a scheduled post has not uploaded yet.
+        if job_id in (thumbs, "autopilot") or job_id in protected:
             continue
         p = os.path.join(OUTPUT_DIR, job_id)
         if os.path.isdir(p):
@@ -680,13 +684,20 @@ async def cleanup_jobs():
         try:
             await asyncio.sleep(300) # Check every 5 minutes
             now = time.time()
-            
+
+            # Clips an Autopilot publish attempt still has to upload. They are
+            # exempt from BOTH sweeps below: a clip scheduled for Thursday is
+            # older than the retention window long before its slot arrives.
+            protected = _autopilot_protected_jobs()
+
             # Simple directory cleanup based on modification time
             # Check OUTPUT_DIR
             for job_id in os.listdir(OUTPUT_DIR):
                 # Not a job: the thumbnails dir backs a StaticFiles mount, so
                 # deleting it would 500 every /thumbnails request until reboot.
                 if job_id == os.path.basename(THUMBNAILS_DIR):
+                    continue
+                if job_id in protected or job_id == "autopilot":
                     continue
                 job_path = os.path.join(OUTPUT_DIR, job_id)
                 if os.path.isdir(job_path):
@@ -701,7 +712,7 @@ async def cleanup_jobs():
             # inside one retention window. Drop the oldest jobs until we're back
             # under the cap — clips are already archived to R2 and get restored
             # on demand, so this only costs a re-download.
-            _enforce_output_size_cap()
+            _enforce_output_size_cap(protected)
             _enforce_uploads_size_cap()
 
             # Cleanup SaaSShorts jobs from memory
@@ -966,6 +977,151 @@ async def _settle_reservation(job_id):
     except Exception as e:
         print(f"⚠️  Reservation settle error for {job_id}: {e}")
 
+# --- Autopilot wiring ---------------------------------------------------------
+# Autopilot is the unattended self-hosted mode. It is deliberately off in cloud
+# mode: an autonomous publisher running per-tenant on shared managed keys is a
+# different product with different safety questions. AUTOPILOT_ENABLED can force
+# either way for local testing.
+_autopilot_default = "0" if BILLING_ENABLED else "1"
+AUTOPILOT_ENABLED = os.environ.get("AUTOPILOT_ENABLED", _autopilot_default).lower() in (
+    "1", "true", "yes")
+# The Upload-Post profile Autopilot posts as. Unattended publishing cannot read
+# the browser's localStorage, so it must come from the environment.
+UPLOAD_POST_USER = os.environ.get("UPLOAD_POST_USER", "").strip() or None
+
+
+async def _autopilot_submit_url(*, url: str, output_format: str = "vertical",
+                                origin: str = "autopilot",
+                                rights_policy: str = "", label: str = "") -> str:
+    """Autopilot's entry into the *existing* clip pipeline.
+
+    Goes through ``submit_clip_job`` — the same function ``/api/process`` uses —
+    so an autonomous job is indistinguishable downstream from a manual one.
+
+    The manual attestation checkbox is NOT synthesised here. Autopilot records
+    the persistent Source Rights Policy that authorised this specific run, which
+    is a different (and auditable) claim.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY must be set server-side for Autopilot")
+
+    job_id = str(uuid.uuid4())
+    job_output_dir = os.path.join(OUTPUT_DIR, job_id)
+    os.makedirs(job_output_dir, exist_ok=True)
+
+    attestation = {
+        "acknowledged": False,
+        "authorised_by": "autopilot_rights_policy",
+        "rights_policy": rights_policy,
+        "ip": "127.0.0.1",
+        "user_agent": f"klippo-autopilot/{origin}",
+        "timestamp": time.time(),
+        "source": "url",
+        "youtube_video_id": label,
+    }
+    print(f"[autopilot] job={job_id} source={label} policy={rights_policy}")
+
+    return await asyncio.to_thread(
+        submit_clip_job,
+        job_id=job_id, job_output_dir=job_output_dir, api_key=api_key, url=url,
+        output_format=output_format, attestation=attestation, priority=2)
+
+
+def _autopilot_job_snapshot(job_id: str):
+    """Read a job's live state out of the in-memory store the queue owns."""
+    from automation.ports import JobSnapshot
+    job = jobs.get(job_id)
+    if job is None:
+        # Not in memory: either it never existed or a restart dropped it. The
+        # disk is authoritative — _recover_jobs_from_disk rebuilds completed
+        # jobs, so anything still missing here really is gone.
+        output_dir = os.path.join(OUTPUT_DIR, job_id)
+        if os.path.isdir(output_dir) and glob.glob(os.path.join(output_dir,
+                                                                "*_metadata.json")):
+            return JobSnapshot(job_id=job_id, status="completed", clips=[],
+                               output_dir=output_dir)
+        return JobSnapshot(job_id=job_id, status="missing",
+                           error="Job not found after restart")
+    clips = ((job.get("result") or {}).get("clips")) or []
+    error = None
+    if job.get("status") == "failed":
+        error = _job_error_text(job.get("logs", []))[:500]
+    return JobSnapshot(job_id=job_id, status=job.get("status", "queued"), clips=clips,
+                       error=error, output_dir=job.get("output_dir"))
+
+
+def _autopilot_clip_path(job_id: str, filename: str):
+    """Absolute path of a clip file, or None. Path-traversal safe."""
+    if not filename:
+        return None
+    safe = _safe_under(os.path.join(OUTPUT_DIR, job_id), os.path.basename(filename))
+    return safe if safe and os.path.exists(safe) else None
+
+
+def _autopilot_active_heavy_jobs() -> int:
+    return sum(1 for j in jobs.values() if j.get("status") in ("queued", "processing"))
+
+
+async def _autopilot_publish(**kwargs):
+    """Autopilot's publish call — the same service the manual button uses."""
+    req = publishing_service.PublishRequest(
+        file_path=kwargs["file_path"],
+        platforms=kwargs["platforms"],
+        user=kwargs["user"],
+        api_key=kwargs["api_key"],
+        title=kwargs.get("title") or "Viral Short",
+        description=kwargs.get("description") or "",
+        youtube_title=kwargs.get("title"),
+        scheduled_date=kwargs.get("scheduled_date"),
+        timezone=kwargs.get("timezone") or "UTC",
+    )
+    result = await publishing_service.publish(req)
+    return result.response
+
+
+def _autopilot_credentials():
+    """Server-side Upload-Post credentials. Never returned through the API."""
+    return (os.environ.get("UPLOAD_POST_API_KEY") or None, UPLOAD_POST_USER)
+
+
+def _autopilot_register_ports():
+    from automation.ports import ClipGeneratorPort, PublisherPort, register
+    register(
+        clip_generator=ClipGeneratorPort(
+            submit_url=_autopilot_submit_url,
+            get_job=_autopilot_job_snapshot,
+            clip_path=_autopilot_clip_path,
+            probe_quality=_probe_youtube_quality,
+            active_heavy_jobs=_autopilot_active_heavy_jobs,
+        ),
+        publisher=PublisherPort(
+            publish=_autopilot_publish,
+            credentials=_autopilot_credentials,
+        ),
+    )
+
+
+def _autopilot_protected_jobs() -> set:
+    """Job ids whose clips a pending publish attempt still needs.
+
+    Retention deletes job directories by age. A clip scheduled for Thursday but
+    generated on Monday would be gone before its upload — so the sweep asks
+    Autopilot what it still depends on.
+    """
+    if not AUTOPILOT_ENABLED:
+        return set()
+    try:
+        from automation.service import get_service
+        return {entry["job_id"] for entry in get_service().files_in_use()}
+    except Exception as e:
+        # Fail *closed* for deletion (protect nothing we can't verify) would be
+        # wrong too — an unreadable DB would then pin the disk forever. Log and
+        # let the sweep proceed; the publish attempt reports the missing file.
+        print(f"⚠️ Could not read Autopilot file references: {e}")
+        return set()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Rehydrate finished jobs from disk before serving (survives restarts).
@@ -978,7 +1134,22 @@ async def lifespan(app: FastAPI):
     cleanup_task = asyncio.create_task(cleanup_jobs())
     if BILLING_ENABLED:
         await cloud.setup_async(app, keep_reservation_ids=_resumed_reservation_ids)
+    if AUTOPILOT_ENABLED:
+        try:
+            from automation.service import get_service
+            _autopilot_register_ports()
+            await get_service().start()
+            print("🤖 Autopilot subsystem ready.")
+        except Exception as e:
+            # A broken Autopilot must never stop the manual app from serving.
+            print(f"⚠️ Autopilot failed to start: {e}")
     yield
+    if AUTOPILOT_ENABLED:
+        try:
+            from automation.service import get_service
+            await get_service().stop()
+        except Exception:
+            pass
     # Cleanup (optional: cancel worker)
 
 app = FastAPI(lifespan=lifespan)
@@ -986,6 +1157,12 @@ app = FastAPI(lifespan=lifespan)
 # Cloud mode: attach middleware + routers at import time (before the app serves).
 if BILLING_ENABLED:
     cloud.setup_sync(app)
+
+# Autopilot routes. Mounted at import time (Starlette forbids adding routes once
+# the app is serving); the engine itself stays off until it is enabled in the UI.
+if AUTOPILOT_ENABLED:
+    from automation.api import router as autopilot_router
+    app.include_router(autopilot_router)
 
 # Enable CORS for frontend. Cloud mode locks this down to the configured origins;
 # self-host keeps the permissive wildcard it has always used.
@@ -1202,12 +1379,64 @@ async def health():
     """Lightweight liveness probe for uptime monitoring / Coolify health checks."""
     return {"status": "ok"}
 
+
+@app.get("/health/detail")
+async def health_detail():
+    """Operational health for an unattended machine.
+
+    Deliberately never reports a credential's value — only whether it is set —
+    and never performs a real social post to prove publishing works.
+    """
+    active = [jid for jid, j in jobs.items() if j.get("status") == "processing"]
+    payload = {
+        "status": "ok",
+        "backend": {
+            "queue_depth": job_queue.qsize(),
+            "active_jobs": len(active),
+            "active_job_ids": active[:5],
+            "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
+            "known_jobs": len(jobs),
+        },
+        "autopilot": {"enabled": AUTOPILOT_ENABLED},
+    }
+    if not AUTOPILOT_ENABLED:
+        return payload
+
+    try:
+        from automation.service import get_service
+        service = get_service()
+        state = service.status()
+        payload["autopilot"] = {
+            "enabled": True,
+            "engine": state["status"],
+            "database": "ok",
+            "db_path": service.db.path,
+            "scheduler": state["scheduler"],
+            "last_discovery_at": state["last_discovery_at"],
+            "last_tick_at": state["last_tick_at"],
+            "current_job": state["current_job"],
+            "pending_publishes": sum(
+                1 for a in state["publish_attempts"] if a["state"] == "PENDING"),
+            "uncertain_publishes": sum(
+                1 for a in state["publish_attempts"] if a["state"] == "UNCERTAIN"),
+            "youtube_quota": state["youtube_quota"],
+            "credentials": state["credentials"],
+            "storage": state["storage"],
+        }
+    except Exception as e:
+        payload["status"] = "degraded"
+        payload["autopilot"] = {"enabled": True, "database": "error", "error": str(e)}
+    return payload
+
 @app.get("/api/config")
 async def get_config():
     return {
         "youtubeUrlEnabled": not DISABLE_YOUTUBE_URL,
         "billingEnabled": BILLING_ENABLED,
         "googleAuthEnabled": bool(BILLING_ENABLED and cloud.settings.google_auth_enabled),
+        # Whether the /api/autopilot/* routes exist at all. The dashboard hides
+        # the tab when they don't, rather than showing a section that 404s.
+        "autopilotEnabled": AUTOPILOT_ENABLED,
     }
 
 async def _probe_youtube_quality(url: str) -> dict:
@@ -1300,15 +1529,8 @@ async def process_endpoint(
     job_output_dir = os.path.join(OUTPUT_DIR, job_id)
     os.makedirs(job_output_dir, exist_ok=True)
 
-    # Prepare Command
-    cmd = ["python", "-u", "main.py"] # -u for unbuffered
-    env = os.environ.copy()
-    env["GEMINI_API_KEY"] = api_key # Override with key from request
-
     input_path = None
-    if url:
-        cmd.extend(["-u", url])
-    else:
+    if file:
         # Save uploaded file with size limit check.
         # basename() strips any path components from the client-supplied
         # filename so a name like "../../main.py" can't escape UPLOAD_DIR.
@@ -1328,22 +1550,66 @@ async def process_endpoint(
                     raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
                 buffer.write(content)
 
+    print(f"[attestation] job={job_id} ip={attestation['ip']} source={attestation['source']} ack=true")
+
+    # Meter + reserve minutes for managed users (no-op for BYOK / self-host).
+    user_id, priority, reservation_id, user_plan = await reserve_process_minutes(request, url, input_path, job_id)
+
+    submit_clip_job(
+        job_id=job_id,
+        job_output_dir=job_output_dir,
+        api_key=api_key,
+        url=url,
+        input_path=input_path,
+        output_format=output_format,
+        attestation=attestation,
+        user_id=user_id,
+        priority=priority,
+        reservation_id=reservation_id,
+        # Free-plan clips carry a burned-in watermark (applied by the main.py
+        # subprocess after each clip renders).
+        watermark=(user_plan == "free"),
+    )
+
+    return {"job_id": job_id, "status": "queued"}
+
+
+def submit_clip_job(*, job_id: str, job_output_dir: str, api_key: str,
+                    url: Optional[str] = None, input_path: Optional[str] = None,
+                    output_format: str = "auto", attestation: Optional[Dict] = None,
+                    user_id=None, priority: int = 2, reservation_id=None,
+                    watermark: bool = False) -> str:
+    """Register and enqueue one clip-generation job. Returns the job id.
+
+    The shared submission path: ``/api/process`` calls it after handling upload
+    and metering, and Autopilot calls it through
+    :class:`automation.ports.ClipGeneratorPort`. Everything downstream — the
+    priority queue, the concurrency semaphore, the resume manifest, the restart
+    recovery — is therefore identical for a manual job and an autonomous one.
+
+    Callers must have created ``job_output_dir`` and, for uploads, already
+    written ``input_path``.
+    """
+    cmd = ["python", "-u", "main.py"]   # -u for unbuffered
+    env = os.environ.copy()
+    env["GEMINI_API_KEY"] = api_key     # Override with key from request
+
+    if url:
+        cmd.extend(["-u", url])
+    elif input_path:
         cmd.extend(["-i", input_path])
+    else:
+        raise ValueError("submit_clip_job needs either a url or an input_path")
 
     cmd.extend(["-o", job_output_dir])
     if output_format and output_format != "auto":
         cmd.extend(["--format", output_format])
 
-    print(f"[attestation] job={job_id} ip={attestation['ip']} source={attestation['source']} ack=true")
-
-    # Meter + reserve minutes for managed users (no-op for BYOK / self-host).
-    user_id, priority, reservation_id, user_plan = await reserve_process_minutes(request, url, input_path, job_id)
-    if user_plan == "free":
-        # Free-plan clips carry a burned-in watermark (applied by the main.py
-        # subprocess after each clip renders).
+    if watermark:
         env["WATERMARK"] = "1"
+    else:
+        env.pop("WATERMARK", None)
 
-    # Enqueue Job
     jobs[job_id] = {
         'status': 'queued',
         'logs': [f"Job {job_id} queued."],
@@ -1353,7 +1619,7 @@ async def process_endpoint(
         'attestation': attestation,
         'user_id': user_id,
         'reservation_id': reservation_id,
-        'watermark': env.get("WATERMARK") == "1",
+        'watermark': bool(watermark),
     }
 
     # Persist the owner so recovered jobs keep their multi-tenant guard after a
@@ -1369,11 +1635,10 @@ async def process_endpoint(
     # Resume manifest: enough to re-run this job if the container dies mid-flight
     # (a redeploy). No secrets — the env is rebuilt from os.environ on resume.
     _write_resume_manifest(job_id, cmd, priority, user_id, reservation_id,
-                           watermark=jobs[job_id]['watermark'])
+                           watermark=bool(watermark))
 
     _enqueue_job(job_id, priority)
-
-    return {"job_id": job_id, "status": "queued"}
+    return job_id
 
 @app.get("/api/status/{job_id}")
 async def get_status(job_id: str, request: Request):
@@ -2510,77 +2775,52 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
 
     try:
         clip = job['result']['clips'][req.clip_index]
-        # Video URL is relative /videos/..., we need absolute file path
-        # clip['video_url'] is like "/videos/{job_id}/{filename}"
-        # We constructed it as: f"/videos/{job_id}/{clip_filename}"
-        # And file is at f"{OUTPUT_DIR}/{job_id}/{clip_filename}"
-        
-        filename = clip['video_url'].split('/')[-1]
-        file_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
-        
-        if not os.path.exists(file_path):
-             raise HTTPException(status_code=404, detail=f"Video file not found: {file_path}")
+    except (IndexError, KeyError, TypeError):
+        raise HTTPException(status_code=404, detail="Clip not found for this job")
 
-        # Construct parameters for Upload-Post API
-        # Fallbacks
-        final_title = req.title or clip.get('title', 'Viral Short')
-        final_description = req.description or clip.get('video_description_for_instagram') or clip.get('video_description_for_tiktok') or "Check this out!"
-        
-        # Prepare form data
-        url = "https://api.upload-post.com/api/upload"
-        headers = {
-            "Authorization": f"Apikey {upload_key}"
-        }
+    # clip['video_url'] is "/videos/{job_id}/{filename}"; the file lives at
+    # OUTPUT_DIR/{job_id}/{filename}. _safe_under rejects a crafted url whose
+    # last path segment tries to climb out of the job directory.
+    filename = os.path.basename((clip.get('video_url') or '').split('/')[-1])
+    file_path = _safe_under(os.path.join(OUTPUT_DIR, req.job_id), filename) if filename else None
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Video file not found for this clip")
 
-        # Prepare data as dict (httpx handles lists for multiple values)
-        data_payload = {
-            "user": post_user,
-            "title": final_title,
-            "platform[]": req.platforms, # Pass list directly
-            "async_upload": "true"  # Enable async upload
-        }
+    # Everything below (payload construction, streaming upload, vendor error
+    # handling) lives in publishing_service so Autopilot publishes through the
+    # exact same code path — see publishing_service.publish.
+    pub_req = publishing_service.PublishRequest(
+        file_path=file_path,
+        filename=filename,
+        platforms=req.platforms,
+        user=post_user,
+        api_key=upload_key,
+        title=req.title or clip.get('title') or 'Viral Short',
+        description=(req.description
+                     or clip.get('video_description_for_instagram')
+                     or clip.get('video_description_for_tiktok')
+                     or "Check this out!"),
+        youtube_title=req.title or clip.get('video_title_for_youtube_short'),
+        scheduled_date=req.scheduled_date,
+        timezone=req.timezone or "UTC",
+    )
 
-        # Add scheduling if present
-        if req.scheduled_date:
-            data_payload["scheduled_date"] = req.scheduled_date
-            if req.timezone:
-                data_payload["timezone"] = req.timezone
-        
-        # Add Platform specifics
-        if "tiktok" in req.platforms:
-             data_payload["tiktok_title"] = final_description
-             
-        if "instagram" in req.platforms:
-             data_payload["instagram_title"] = final_description
-             data_payload["media_type"] = "REELS"
-
-        if "youtube" in req.platforms:
-             yt_title = req.title or clip.get('video_title_for_youtube_short', final_title)
-             data_payload["youtube_title"] = yt_title
-             data_payload["youtube_description"] = final_description
-             data_payload["privacyStatus"] = "public"
-
-        # Send File
-        # httpx AsyncClient requires async file reading or bytes. 
-        # Since we have MAX_FILE_SIZE_MB, reading into memory is safe-ish.
-        with open(file_path, "rb") as f:
-            file_content = f.read()
-            
-        files = {
-            "video": (filename, file_content, "video/mp4")
-        }
-
-        # Switch to synchronous Client to avoid "sync request with AsyncClient" error with multipart/files
-        with httpx.Client(timeout=120.0) as client:
-            print(f"📡 Sending to Upload-Post for platforms: {req.platforms}")
-            response = client.post(url, headers=headers, data=data_payload, files=files)
-            
-        if response.status_code not in [200, 201, 202]: # Added 201
-             print(f"❌ Upload-Post Error: {response.text}")
-             raise HTTPException(status_code=response.status_code, detail=f"Vendor API Error: {response.text}")
-
-        return response.json()
-
+    try:
+        print(f"📡 Sending to Upload-Post for platforms: {req.platforms}")
+        result = await publishing_service.publish(pub_req)
+        return result.response
+    except publishing_service.PublishError as e:
+        print(f"❌ Upload-Post Error: {e}")
+        raise HTTPException(status_code=e.status or 502,
+                            detail=f"Vendor API Error: {e.body or e}")
+    except publishing_service.PublishUncertain as e:
+        # The request left the process without a verdict. Reporting success
+        # would be a guess, and the vendor has no idempotency key to make a
+        # retry safe — say so instead.
+        print(f"⚠️ Upload-Post outcome unknown: {e}")
+        raise HTTPException(status_code=504, detail=(
+            "Upload-Post did not answer. The post may or may not have been "
+            "created — check your Upload-Post calendar before retrying."))
     except Exception as e:
         print(f"❌ Social Post Exception: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -2596,57 +2836,24 @@ async def get_social_user(request: Request):
     if not api_key:
          raise HTTPException(status_code=400, detail="Missing X-Upload-Post-Key header")
 
-    url = "https://api.upload-post.com/api/uploadposts/users"
-    print(f"🔍 Fetching User ID from: {url}")
-    headers = {"Authorization": f"Apikey {api_key}"}
-    
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code != 200:
-                print(f"❌ Upload-Post User Fetch Error: {resp.text}")
-                raise HTTPException(status_code=resp.status_code, detail=f"Failed to fetch user: {resp.text}")
-            
-            data = resp.json()
-            print(f"🔍 Upload-Post User Response: {data}")
-            
-            user_id = None
-            # The structure is {'success': True, 'profiles': [{'username': '...'}, ...]}
-            profiles_list = []
-            if isinstance(data, dict):
-                 raw_profiles = data.get('profiles', [])
-                 if isinstance(raw_profiles, list):
-                     for p in raw_profiles:
-                         username = p.get('username')
-                         if username:
-                             # Determine connected platforms
-                             socials = p.get('social_accounts', {})
-                             connected = []
-                             # Check typical platforms
-                             for platform in ['tiktok', 'instagram', 'youtube']:
-                                 account_info = socials.get(platform)
-                                 # If it's a dict and typically has data, or just not empty string
-                                 if isinstance(account_info, dict):
-                                     connected.append(platform)
-                             
-                             profiles_list.append({
-                                 "username": username,
-                                 "connected": connected
-                             })
-            
-            # Managed users must only ever see their own profile.
-            if forced_profile is not None:
-                profiles_list = [p for p in profiles_list if p.get("username") == forced_profile]
+    try:
+        # Same parser Autopilot uses to discover its unattended profile.
+        profiles_list = await publishing_service.list_profiles(api_key)
+    except publishing_service.PublishError as e:
+        print(f"❌ Upload-Post User Fetch Error: {e}")
+        raise HTTPException(status_code=e.status or 502, detail=f"Failed to fetch user: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-            if not profiles_list:
-                # Fallback if no profiles found
-                return {"profiles": [], "error": "No profiles found"}
+    # Managed users must only ever see their own profile.
+    if forced_profile is not None:
+        profiles_list = [p for p in profiles_list if p.get("username") == forced_profile]
 
-            return {"profiles": profiles_list}
-            
-            
-        except Exception as e:
-             raise HTTPException(status_code=500, detail=str(e))
+    if not profiles_list:
+        # Fallback if no profiles found
+        return {"profiles": [], "error": "No profiles found"}
+
+    return {"profiles": profiles_list}
 
 # --- Thumbnail Studio Endpoints ---
 
@@ -3390,63 +3597,41 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
     if not result or not result.get("video_url"):
         raise HTTPException(status_code=400, detail="No video available for this job")
 
+    # Resolve video file path. e.g. /videos/saas_xxx/slug_final.mp4
+    rel_path = (result["video_url"] or "").replace("/videos/", "")
+    file_path = _safe_under(OUTPUT_DIR, rel_path)
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    script = result.get("script", {})
+    final_title = req.title or script.get("title", "AI Short")
+    final_description = (req.description or script.get("caption")
+                         or script.get("full_narration") or "Check this out!")
+
+    # Same publishing service as the Clip Generator and Autopilot — the
+    # Upload-Post payload is built in exactly one place.
+    pub_req = publishing_service.PublishRequest(
+        file_path=file_path,
+        platforms=req.platforms,
+        user=post_user,
+        api_key=upload_key,
+        title=final_title,
+        description=final_description,
+        youtube_title=final_title,
+        scheduled_date=req.scheduled_date,
+        timezone=req.timezone or "UTC",
+    )
+
     try:
-        # Resolve video file path
-        video_url = result["video_url"]  # e.g. /videos/saas_xxx/slug_final.mp4
-        rel_path = video_url.replace("/videos/", "")
-        file_path = os.path.join(OUTPUT_DIR, rel_path)
-
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail=f"Video file not found")
-
-        script = result.get("script", {})
-        final_title = req.title or script.get("title", "AI Short")
-        final_description = req.description or script.get("caption", "")
-        if not final_description:
-            final_description = script.get("full_narration", "Check this out!")
-
-        url = "https://api.upload-post.com/api/upload"
-        headers = {"Authorization": f"Apikey {upload_key}"}
-
-        data_payload = {
-            "user": post_user,
-            "title": final_title,
-            "platform[]": req.platforms,
-            "async_upload": "true",
-        }
-
-        if req.scheduled_date:
-            data_payload["scheduled_date"] = req.scheduled_date
-            if req.timezone:
-                data_payload["timezone"] = req.timezone
-
-        if "tiktok" in req.platforms:
-            data_payload["tiktok_title"] = final_description
-        if "instagram" in req.platforms:
-            data_payload["instagram_title"] = final_description
-            data_payload["media_type"] = "REELS"
-        if "youtube" in req.platforms:
-            data_payload["youtube_title"] = final_title
-            data_payload["youtube_description"] = final_description
-            data_payload["privacyStatus"] = "public"
-
-        filename = os.path.basename(file_path)
-        with open(file_path, "rb") as f:
-            file_content = f.read()
-
-        files = {"video": (filename, file_content, "video/mp4")}
-
-        with httpx.Client(timeout=120.0) as client:
-            print(f"📡 [AI Shorts] Sending to Upload-Post: {req.platforms}")
-            response = client.post(url, headers=headers, data=data_payload, files=files)
-
-        if response.status_code not in [200, 201, 202]:
-            raise HTTPException(status_code=response.status_code, detail=f"Upload-Post Error: {response.text}")
-
-        return response.json()
-
-    except HTTPException:
-        raise
+        print(f"📡 [AI Shorts] Sending to Upload-Post: {req.platforms}")
+        return (await publishing_service.publish(pub_req)).response
+    except publishing_service.PublishError as e:
+        raise HTTPException(status_code=e.status or 502,
+                            detail=f"Upload-Post Error: {e.body or e}")
+    except publishing_service.PublishUncertain as e:
+        raise HTTPException(status_code=504, detail=(
+            "Upload-Post did not answer. The post may or may not have been "
+            "created — check your Upload-Post calendar before retrying."))
     except Exception as e:
         print(f"❌ [AI Shorts] Post Exception: {e}")
         raise HTTPException(status_code=500, detail=str(e))
