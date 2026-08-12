@@ -24,10 +24,10 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .models import (
     ClipState, DiscoveredSource, GeneratedClip, PublishAttempt, PublishState,
-    SourceState, assert_transition,
+    SourceState, assert_publish_transition, assert_transition,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # The DB lives beside the job output on the persistent volume, never in the
 # ephemeral container layer. AUTOPILOT_DB_PATH overrides it for tests/ops.
@@ -165,18 +165,36 @@ CREATE TABLE IF NOT EXISTS publish_attempt (
     submitted_at      TEXT,
     created_at        TEXT NOT NULL,
     title             TEXT NOT NULL DEFAULT '',
-    description       TEXT NOT NULL DEFAULT ''
+    description       TEXT NOT NULL DEFAULT '',
+    -- v2: vendor reconciliation. A 2xx from /upload only means "accepted", so
+    -- these are what let us later ask Upload-Post what actually happened.
+    vendor_request_id TEXT,          -- ours, sent with the request (async tracking)
+    vendor_job_id     TEXT,          -- theirs, returned for scheduled posts
+    vendor_status     TEXT,          -- last top-level status seen
+    vendor_results    TEXT,          -- per-platform outcomes, JSON
+    last_status_check_at TEXT,
+    next_status_check_at TEXT,
+    finalized_at      TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_publish_state ON publish_attempt (state, scheduled_for_utc);
+CREATE INDEX IF NOT EXISTS ix_publish_recheck ON publish_attempt (next_status_check_at)
+    WHERE next_status_check_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_publish_vendor_job ON publish_attempt (vendor_job_id)
+    WHERE vendor_job_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_publish_slot ON publish_attempt (scheduled_for_utc);
 CREATE INDEX IF NOT EXISTS ix_publish_clip ON publish_attempt (clip_id);
 -- One live attempt per clip: a duplicate scheduler tick can insert a second row
 -- only if the first was canceled or hard-failed.
-CREATE UNIQUE INDEX IF NOT EXISTS ux_publish_live_clip ON publish_attempt (clip_id)
-    WHERE state IN ('PENDING', 'IN_FLIGHT', 'SUBMITTED', 'UNCERTAIN');
+-- v2 widened these to the new lifecycle states. A clip that is PUBLISHING,
+-- PUBLISHED or PARTIAL_FAILED must still block a second attempt: the vendor has
+-- the content, so another request would post it twice.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_publish_live_clip_v2 ON publish_attempt (clip_id)
+    WHERE state IN ('PENDING', 'IN_FLIGHT', 'SUBMITTED', 'PUBLISHING', 'PUBLISHED',
+                    'PARTIAL_FAILED', 'UNCERTAIN');
 -- One post per slot: two clips can never be handed the same publishing time.
-CREATE UNIQUE INDEX IF NOT EXISTS ux_publish_live_slot ON publish_attempt (scheduled_for_utc)
-    WHERE state IN ('PENDING', 'IN_FLIGHT', 'SUBMITTED', 'UNCERTAIN');
+CREATE UNIQUE INDEX IF NOT EXISTS ux_publish_live_slot_v2 ON publish_attempt (scheduled_for_utc)
+    WHERE state IN ('PENDING', 'IN_FLIGHT', 'SUBMITTED', 'PUBLISHING', 'PUBLISHED',
+                    'PARTIAL_FAILED', 'UNCERTAIN');
 
 CREATE TABLE IF NOT EXISTS event_log (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -194,13 +212,19 @@ CREATE TABLE IF NOT EXISTS event_log (
 CREATE INDEX IF NOT EXISTS ix_event_ts ON event_log (ts DESC);
 CREATE INDEX IF NOT EXISTS ix_event_source ON event_log (source_id, ts DESC);
 
+-- v2: one row per QUOTA BUCKET, not per provider. Since 1-jun-2026 the YouTube
+-- Data API bills search.list against its own daily allocation (~100 calls),
+-- independent of the 10,000-unit pool every other endpoint shares. Collapsing
+-- them into one counter meant a search exhaustion disabled chart discovery too.
 CREATE TABLE IF NOT EXISTS api_quota (
-    provider     TEXT PRIMARY KEY,
+    provider     TEXT NOT NULL,
+    bucket       TEXT NOT NULL DEFAULT 'general',
     day          TEXT NOT NULL,
     units_used   INTEGER NOT NULL DEFAULT 0,
     exhausted_until TEXT,
     last_error   TEXT,
-    updated_at   TEXT NOT NULL
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (provider, bucket)
 );
 """
 
@@ -280,23 +304,115 @@ class AutopilotDB:
     def _migrate(self) -> None:
         """Create/upgrade the schema, versioned through PRAGMA user_version.
 
-        v1 is the initial schema. Later versions append their DDL to the
-        ``if version < N`` ladder — never edit an existing block, so an
-        already-deployed database upgrades by replaying only what it missed.
+        Forward-only and non-destructive: an existing database is upgraded in
+        place, never recreated. Each version's block runs once, inside one
+        transaction, so a crash mid-upgrade leaves the old version intact rather
+        than a half-migrated file.
         """
         conn = self._conn
         assert conn is not None
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version == 0:
-            conn.executescript(_SCHEMA)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif version > SCHEMA_VERSION:
+
+        if version > SCHEMA_VERSION:
             raise RuntimeError(
                 f"Autopilot database is at schema v{version}, this build understands "
                 f"v{SCHEMA_VERSION}. Refusing to run against a newer schema.")
-        # Idempotent: brings a v1 file created by an older build up to date on
-        # the additive-only parts (new indexes/tables) without a data migration.
+
+        if version == 0:
+            # Fresh database: the current schema is already the target.
+            conn.executescript(_SCHEMA)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            return
+
+        if version < 2:
+            self._migrate_v1_to_v2(conn)
+            conn.execute("PRAGMA user_version = 2")
+
+        # Idempotent tail: creates anything additive the running version added
+        # (new tables/indexes) without touching existing data.
         conn.executescript(_SCHEMA)
+
+    def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
+        """v1 → v2: vendor reconciliation columns and split quota buckets.
+
+        v1 treated "Upload-Post accepted the job" as "published". v2 separates
+        them, which needs somewhere to keep the vendor identifiers and the
+        polling schedule. Existing rows are preserved and, where v1 already
+        stored the vendor response, their identifiers are recovered from it so
+        historic attempts can still be reconciled rather than being stranded.
+        """
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(publish_attempt)")}
+            for column, ddl in (
+                ("vendor_request_id", "TEXT"),
+                ("vendor_job_id", "TEXT"),
+                ("vendor_status", "TEXT"),
+                ("vendor_results", "TEXT"),
+                ("last_status_check_at", "TEXT"),
+                ("next_status_check_at", "TEXT"),
+                ("finalized_at", "TEXT"),
+            ):
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE publish_attempt ADD COLUMN {column} {ddl}")
+
+            # Recover identifiers v1 never broke out of the stored response, so
+            # an already-submitted post keeps a route to reconciliation.
+            now = iso(utcnow())
+            for row in conn.execute(
+                    "SELECT id, vendor_response FROM publish_attempt "
+                    "WHERE vendor_response IS NOT NULL").fetchall():
+                payload = _json_loads(row["vendor_response"], None)
+                if not isinstance(payload, dict):
+                    continue
+                request_id = payload.get("request_id")
+                job_id = payload.get("job_id")
+                if request_id or job_id:
+                    conn.execute(
+                        "UPDATE publish_attempt SET vendor_request_id = ?, vendor_job_id = ? "
+                        "WHERE id = ?",
+                        (str(request_id) if request_id else None,
+                         str(job_id) if job_id else None, row["id"]))
+
+            # v1 SUBMITTED rows were shown to the user as "published" without
+            # ever asking the vendor. Queue them for a status check instead of
+            # guessing either way; reconciliation will settle each one.
+            conn.execute(
+                "UPDATE publish_attempt SET next_status_check_at = ? WHERE state = 'SUBMITTED'",
+                (now,))
+
+            # The old partial indexes named a narrower state set; they would now
+            # let a PUBLISHING/PARTIAL_FAILED attempt double-book a clip or slot.
+            conn.execute("DROP INDEX IF EXISTS ux_publish_live_clip")
+            conn.execute("DROP INDEX IF EXISTS ux_publish_live_slot")
+
+            # api_quota gains `bucket` in its primary key, which SQLite cannot do
+            # in place — rebuild it, carrying every existing row into 'general'.
+            quota_columns = {row[1] for row in conn.execute("PRAGMA table_info(api_quota)")}
+            if "bucket" not in quota_columns:
+                conn.execute("ALTER TABLE api_quota RENAME TO api_quota_v1")
+                conn.execute("""
+                    CREATE TABLE api_quota (
+                        provider     TEXT NOT NULL,
+                        bucket       TEXT NOT NULL DEFAULT 'general',
+                        day          TEXT NOT NULL,
+                        units_used   INTEGER NOT NULL DEFAULT 0,
+                        exhausted_until TEXT,
+                        last_error   TEXT,
+                        updated_at   TEXT NOT NULL,
+                        PRIMARY KEY (provider, bucket)
+                    )""")
+                conn.execute("""
+                    INSERT INTO api_quota
+                        (provider, bucket, day, units_used, exhausted_until, last_error, updated_at)
+                    SELECT provider, 'general', day, units_used, exhausted_until, last_error,
+                           updated_at FROM api_quota_v1""")
+                conn.execute("DROP TABLE api_quota_v1")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
 
     @contextmanager
     def tx(self):
@@ -723,24 +839,117 @@ class AutopilotDB:
     def set_publish_state(self, attempt_id: int, state: str, *,
                           vendor_response: Optional[Dict] = None,
                           error: Optional[str] = None,
-                          increment_retry: bool = False) -> None:
+                          increment_retry: bool = False,
+                          vendor_request_id: Optional[str] = None,
+                          vendor_job_id: Optional[str] = None,
+                          vendor_status: Optional[str] = None,
+                          vendor_results: Optional[List[Dict]] = None,
+                          next_status_check_at: Optional[str] = None,
+                          mark_checked: bool = False,
+                          expected: Optional[Iterable[str]] = None) -> bool:
+        """Move a publish attempt, optionally recording what the vendor said.
+
+        ``expected`` makes this a compare-and-set, which is what stops a status
+        poll and an operator action racing each other into an inconsistent
+        state. Returns False when the row was not in ``expected``.
+        """
         if state not in PublishState.ALL:
             raise ValueError(f"Unknown publish state {state!r}")
-        sets = ["state = ?"]
-        params: List[Any] = [state]
-        if vendor_response is not None:
-            sets.append("vendor_response = ?")
-            params.append(json.dumps(vendor_response)[:8000])
-        if error is not None:
-            sets.append("error = ?")
-            params.append(str(error)[:1000])
-        if increment_retry:
-            sets.append("retry_count = retry_count + 1")
-        if state == PublishState.SUBMITTED:
-            sets.append("submitted_at = ?")
-            params.append(iso(utcnow()))
-        params.append(attempt_id)
-        self.execute(f"UPDATE publish_attempt SET {', '.join(sets)} WHERE id = ?", params)
+
+        with self.tx() as conn:
+            row = conn.execute("SELECT state FROM publish_attempt WHERE id = ?",
+                               (attempt_id,)).fetchone()
+            if row is None:
+                return False
+            current = row["state"]
+            if expected is not None and current not in set(expected):
+                return False
+            assert_publish_transition(current, state)
+
+            sets = ["state = ?"]
+            params: List[Any] = [state]
+            if vendor_response is not None:
+                sets.append("vendor_response = ?")
+                params.append(json.dumps(vendor_response)[:8000])
+            if error is not None:
+                sets.append("error = ?")
+                params.append(str(error)[:1000])
+            if increment_retry:
+                sets.append("retry_count = retry_count + 1")
+            if vendor_request_id is not None:
+                sets.append("vendor_request_id = ?")
+                params.append(str(vendor_request_id)[:200])
+            if vendor_job_id is not None:
+                sets.append("vendor_job_id = ?")
+                params.append(str(vendor_job_id)[:200])
+            if vendor_status is not None:
+                sets.append("vendor_status = ?")
+                params.append(str(vendor_status)[:60])
+            if vendor_results is not None:
+                sets.append("vendor_results = ?")
+                params.append(json.dumps(vendor_results)[:8000])
+            if mark_checked:
+                sets.append("last_status_check_at = ?")
+                params.append(iso(utcnow()))
+            # An explicit None clears the schedule; that is how a terminal state
+            # stops being polled.
+            sets.append("next_status_check_at = ?")
+            params.append(next_status_check_at)
+            if state == PublishState.SUBMITTED and current != PublishState.SUBMITTED:
+                sets.append("submitted_at = ?")
+                params.append(iso(utcnow()))
+            if state in PublishState.TERMINAL or state == PublishState.PARTIAL_FAILED:
+                sets.append("finalized_at = ?")
+                params.append(iso(utcnow()))
+
+            params.append(attempt_id)
+            conn.execute(f"UPDATE publish_attempt SET {', '.join(sets)} WHERE id = ?", params)
+            return True
+
+    def record_vendor_ids(self, attempt_id: int, *, request_id: Optional[str],
+                          job_id: Optional[str]) -> None:
+        """Persist our request_id BEFORE the network call.
+
+        This is the whole reason an ambiguous timeout is recoverable: without a
+        stored identifier there is nothing to ask the vendor about afterwards.
+        """
+        self.execute(
+            "UPDATE publish_attempt SET vendor_request_id = COALESCE(?, vendor_request_id), "
+            "vendor_job_id = COALESCE(?, vendor_job_id) WHERE id = ?",
+            (request_id, job_id, attempt_id))
+
+    def attempts_due_for_status_check(self, now: datetime, limit: int = 10
+                                      ) -> List[PublishAttempt]:
+        """Non-terminal attempts whose next poll is due.
+
+        Driven by a persisted ``next_status_check_at`` so a restart resumes the
+        vendor's recommended cadence instead of stampeding every open attempt.
+        """
+        states = list(PublishState.NEEDS_RECONCILIATION)
+        rows = self.query(
+            f"SELECT * FROM publish_attempt WHERE state IN ({','.join('?' * len(states))}) "
+            "AND (vendor_request_id IS NOT NULL OR vendor_job_id IS NOT NULL) "
+            "AND (next_status_check_at IS NULL OR next_status_check_at <= ?) "
+            "ORDER BY COALESCE(next_status_check_at, created_at) LIMIT ?",
+            (*states, iso(now), max(1, min(50, int(limit)))))
+        return [_row_to_publish(row) for row in rows]
+
+    def vendor_scheduled_attempts(self, *, after: Optional[datetime] = None
+                                  ) -> List[PublishAttempt]:
+        """Attempts Upload-Post is holding as future scheduled jobs.
+
+        Emergency Stop uses this to know exactly which vendor jobs are Klippo's
+        to cancel — Manual Mode posts are not in this table at all.
+        """
+        sql = ("SELECT * FROM publish_attempt WHERE vendor_job_id IS NOT NULL "
+               "AND state IN (?, ?, ?)")
+        params: List[Any] = [PublishState.SUBMITTED, PublishState.PUBLISHING,
+                             PublishState.UNCERTAIN]
+        if after is not None:
+            sql += " AND scheduled_for_utc >= ?"
+            params.append(iso(after))
+        sql += " ORDER BY scheduled_for_utc"
+        return [_row_to_publish(row) for row in self.query(sql, params)]
 
     def get_publish_attempt(self, attempt_id: int) -> Optional[PublishAttempt]:
         row = self.query_one("SELECT * FROM publish_attempt WHERE id = ?", (attempt_id,))
@@ -796,52 +1005,78 @@ class AutopilotDB:
 
     # --- quota ----------------------------------------------------------------
 
-    def get_quota(self, provider: str = "youtube") -> Dict[str, Any]:
-        row = self.query_one("SELECT * FROM api_quota WHERE provider = ?", (provider,))
+    def get_quota(self, provider: str = "youtube", bucket: str = "general") -> Dict[str, Any]:
+        """Usage for one quota bucket, resetting the counter on a new day."""
+        row = self.query_one(
+            "SELECT * FROM api_quota WHERE provider = ? AND bucket = ?", (provider, bucket))
         today = utcnow().strftime("%Y-%m-%d")
         if row is None:
-            return {"provider": provider, "day": today, "units_used": 0,
-                    "exhausted_until": None, "last_error": None}
+            return {"provider": provider, "bucket": bucket, "day": today,
+                    "units_used": 0, "exhausted_until": None, "last_error": None}
         data = dict(row)
         if data.get("day") != today:
             data["units_used"] = 0
             data["day"] = today
         return data
 
-    def add_quota_units(self, units: int, provider: str = "youtube") -> None:
+    def add_quota_units(self, units: int, provider: str = "youtube",
+                        bucket: str = "general") -> None:
         today = utcnow().strftime("%Y-%m-%d")
         with self.tx() as conn:
-            row = conn.execute("SELECT day, units_used FROM api_quota WHERE provider = ?",
-                               (provider,)).fetchone()
+            row = conn.execute(
+                "SELECT day, units_used FROM api_quota WHERE provider = ? AND bucket = ?",
+                (provider, bucket)).fetchone()
             if row is None:
                 conn.execute(
-                    "INSERT INTO api_quota (provider, day, units_used, updated_at) "
-                    "VALUES (?, ?, ?, ?)", (provider, today, int(units), iso(utcnow())))
+                    "INSERT INTO api_quota (provider, bucket, day, units_used, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (provider, bucket, today, int(units), iso(utcnow())))
             else:
                 used = int(units) if row["day"] != today else int(row["units_used"]) + int(units)
                 conn.execute(
                     "UPDATE api_quota SET day = ?, units_used = ?, updated_at = ? "
-                    "WHERE provider = ?", (today, used, iso(utcnow()), provider))
+                    "WHERE provider = ? AND bucket = ?",
+                    (today, used, iso(utcnow()), provider, bucket))
 
     def mark_quota_exhausted(self, until: datetime, error: str,
-                             provider: str = "youtube") -> None:
-        """Park the provider until ``until``.
+                             provider: str = "youtube",
+                             bucket: str = "general") -> None:
+        """Park ONE bucket until ``until``.
 
-        Without this a quota-exhausted key turns into a tight retry loop that
-        burns the *next* day's quota the moment it resets.
+        Per bucket, deliberately: since the search allocation became independent
+        of the general pool, an exhausted search quota must not stop chart-based
+        discovery, which draws from a pool that still has units left.
         """
         today = utcnow().strftime("%Y-%m-%d")
         with self.tx() as conn:
             conn.execute(
-                "INSERT INTO api_quota (provider, day, units_used, exhausted_until, last_error,"
-                " updated_at) VALUES (?, ?, 0, ?, ?, ?) "
-                "ON CONFLICT(provider) DO UPDATE SET exhausted_until = excluded.exhausted_until,"
+                "INSERT INTO api_quota (provider, bucket, day, units_used, exhausted_until,"
+                " last_error, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?) "
+                "ON CONFLICT(provider, bucket) DO UPDATE SET "
+                " exhausted_until = excluded.exhausted_until,"
                 " last_error = excluded.last_error, updated_at = excluded.updated_at",
-                (provider, today, iso(until), str(error)[:500], iso(utcnow())))
+                (provider, bucket, today, iso(until), str(error)[:500], iso(utcnow())))
 
-    def clear_quota_block(self, provider: str = "youtube") -> None:
-        self.execute("UPDATE api_quota SET exhausted_until = NULL WHERE provider = ?",
-                     (provider,))
+    def clear_quota_block(self, provider: str = "youtube",
+                          bucket: Optional[str] = None) -> None:
+        if bucket is None:
+            self.execute("UPDATE api_quota SET exhausted_until = NULL WHERE provider = ?",
+                         (provider,))
+        else:
+            self.execute(
+                "UPDATE api_quota SET exhausted_until = NULL "
+                "WHERE provider = ? AND bucket = ?", (provider, bucket))
+
+    def quota_blocked(self, now: datetime, provider: str = "youtube",
+                      bucket: str = "general") -> Optional[datetime]:
+        """When this bucket frees up, or None. Clears a lapsed block in passing."""
+        quota = self.get_quota(provider, bucket)
+        until = parse_iso(quota.get("exhausted_until"))
+        if until and until > now:
+            return until
+        if until:
+            self.clear_quota_block(provider, bucket)
+        return None
 
 
 # --- row mappers --------------------------------------------------------------
@@ -887,4 +1122,19 @@ def _row_to_publish(row: sqlite3.Row) -> PublishAttempt:
         state=row["state"], vendor_response=_json_loads(row["vendor_response"], None),
         error=row["error"], retry_count=row["retry_count"], submitted_at=row["submitted_at"],
         created_at=row["created_at"], title=row["title"], description=row["description"],
+        vendor_request_id=_column(row, "vendor_request_id"),
+        vendor_job_id=_column(row, "vendor_job_id"),
+        vendor_status=_column(row, "vendor_status"),
+        vendor_results=_json_loads(_column(row, "vendor_results"), None),
+        last_status_check_at=_column(row, "last_status_check_at"),
+        next_status_check_at=_column(row, "next_status_check_at"),
+        finalized_at=_column(row, "finalized_at"),
     )
+
+
+def _column(row: sqlite3.Row, name: str):
+    """Read a column that may not exist yet on a database mid-upgrade."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None

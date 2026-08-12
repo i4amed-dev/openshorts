@@ -12,7 +12,7 @@ import pytest
 from automation.db import AutopilotDB, iso, parse_iso, utcnow
 from automation.models import (
     ClipState, DiscoveredSource, GeneratedClip, PublishAttempt, PublishState, SourceState,
-    TransitionError, assert_transition,
+    TransitionError, assert_publish_transition, assert_transition,
 )
 from automation.publishing import idempotency_key
 
@@ -224,6 +224,7 @@ class TestPublishIdempotency:
                                               clip_index=0, filename="d.mp4"))
         slot = utcnow() + timedelta(hours=2)
         first = db.reserve_publish_attempt(self._attempt(source_id, clip_a, slot))
+        db.set_publish_state(first, PublishState.IN_FLIGHT)
         db.set_publish_state(first, PublishState.UNCERTAIN)
         # The post may already exist at that time — nothing else may take it.
         assert db.reserve_publish_attempt(
@@ -236,6 +237,38 @@ class TestPublishIdempotency:
         assert len(db.taken_slots(utcnow())) == 1
         db.set_publish_state(attempt_id, PublishState.FAILED)
         assert db.taken_slots(utcnow()) == []
+
+    def test_a_vendor_scheduled_attempt_still_holds_its_slot(self, db):
+        """Upload-Post is holding it — nothing else may claim that moment."""
+        source_id, clip_a = self._clip(db, index=0)
+        clip_b = db.upsert_clip(GeneratedClip(source_id=source_id, job_id="job-2",
+                                              clip_index=0, filename="d.mp4"))
+        slot = utcnow() + timedelta(hours=2)
+        first = db.reserve_publish_attempt(self._attempt(source_id, clip_a, slot))
+        db.set_publish_state(first, PublishState.IN_FLIGHT)
+        db.set_publish_state(first, PublishState.SUBMITTED, vendor_job_id="job_9")
+        assert db.reserve_publish_attempt(
+            self._attempt(source_id, clip_b, slot, job_id="job-2")) is None
+
+    def test_a_published_attempt_still_blocks_a_second_send(self, db):
+        """The strongest duplicate guard: it is already live."""
+        source_id, clip_id = self._clip(db)
+        slot = utcnow() + timedelta(hours=2)
+        attempt_id = db.reserve_publish_attempt(self._attempt(source_id, clip_id, slot))
+        db.set_publish_state(attempt_id, PublishState.IN_FLIGHT)
+        db.set_publish_state(attempt_id, PublishState.SUBMITTED)
+        db.set_publish_state(attempt_id, PublishState.PUBLISHED)
+        assert db.reserve_publish_attempt(self._attempt(source_id, clip_id, slot)) is None
+
+    def test_a_partial_failure_blocks_a_second_send(self, db):
+        """Resending would duplicate the platforms that already succeeded."""
+        source_id, clip_id = self._clip(db)
+        slot = utcnow() + timedelta(hours=2)
+        attempt_id = db.reserve_publish_attempt(self._attempt(source_id, clip_id, slot))
+        db.set_publish_state(attempt_id, PublishState.IN_FLIGHT)
+        db.set_publish_state(attempt_id, PublishState.SUBMITTED)
+        db.set_publish_state(attempt_id, PublishState.PARTIAL_FAILED)
+        assert db.reserve_publish_attempt(self._attempt(source_id, clip_id, slot)) is None
 
 
 class TestClips:
@@ -276,27 +309,48 @@ class TestRetentionReferences:
         assert db.files_in_use() == [{"job_id": "job-9", "filename": "clip_1.mp4"}]
 
     def test_a_submitted_publish_no_longer_pins_the_file(self, db):
-        # Once the vendor holds the bytes, the local copy is expendable.
+        # Once the vendor holds the bytes, the local copy is expendable — even
+        # though the post itself is not live yet.
         source_id, _ = db.upsert_source(make_source())
         clip_id = db.upsert_clip(GeneratedClip(source_id=source_id, job_id="job-9",
                                                clip_index=0, filename="clip_1.mp4"))
         attempt_id = db.reserve_publish_attempt(PublishAttempt(
             clip_id=clip_id, source_id=source_id, job_id="job-9", clip_index=0,
             idempotency_key="k1", platforms=["tiktok"]))
+        db.set_publish_state(attempt_id, PublishState.IN_FLIGHT)
         db.set_publish_state(attempt_id, PublishState.SUBMITTED)
         assert db.files_in_use() == []
 
 
 class TestQuotaTracking:
     def test_units_accumulate_within_a_day(self, db):
-        db.add_quota_units(100)
         db.add_quota_units(1)
-        assert db.get_quota()["units_used"] == 101
+        db.add_quota_units(1)
+        assert db.get_quota()["units_used"] == 2
+
+    def test_buckets_are_counted_separately(self, db):
+        """Search and the general pool are independent allocations."""
+        db.add_quota_units(5, bucket="general")
+        db.add_quota_units(2, bucket="search")
+        assert db.get_quota(bucket="general")["units_used"] == 5
+        assert db.get_quota(bucket="search")["units_used"] == 2
 
     def test_an_exhausted_key_is_parked(self, db):
         until = utcnow() + timedelta(hours=5)
         db.mark_quota_exhausted(until, "quotaExceeded")
         assert parse_iso(db.get_quota()["exhausted_until"]) is not None
+
+    def test_exhausting_search_leaves_the_general_pool_usable(self, db):
+        """The bug this split fixes: chart discovery must survive a search 403."""
+        db.mark_quota_exhausted(utcnow() + timedelta(hours=5), "quotaExceeded",
+                                bucket="search")
+        assert db.quota_blocked(utcnow(), bucket="search") is not None
+        assert db.quota_blocked(utcnow(), bucket="general") is None
+
+    def test_a_lapsed_block_clears_itself(self, db):
+        db.mark_quota_exhausted(utcnow() - timedelta(minutes=1), "quotaExceeded")
+        assert db.quota_blocked(utcnow()) is None
+        assert db.get_quota()["exhausted_until"] is None
 
     def test_the_block_can_be_cleared(self, db):
         db.mark_quota_exhausted(utcnow() + timedelta(hours=5), "quotaExceeded")
@@ -344,3 +398,90 @@ def test_database_survives_a_reopen(tmp_path):
     reopened = second.get_source_by_video_id("vid00000001")
     assert reopened.state == SourceState.ELIGIBLE
     second.close()
+
+
+class TestPublishStateMachine:
+    """Every legal transition, and loud rejection of the rest.
+
+    The lifecycle exists to keep "the vendor accepted it" and "it is live on the
+    platform" apart, so the transitions between those states are worth pinning
+    individually.
+    """
+
+    @pytest.mark.parametrize("current,target", [
+        (PublishState.PENDING, PublishState.IN_FLIGHT),
+        (PublishState.IN_FLIGHT, PublishState.SUBMITTED),
+        (PublishState.IN_FLIGHT, PublishState.UNCERTAIN),
+        (PublishState.SUBMITTED, PublishState.PUBLISHING),
+        (PublishState.SUBMITTED, PublishState.PUBLISHED),
+        (PublishState.SUBMITTED, PublishState.CANCELED),
+        (PublishState.PUBLISHING, PublishState.PUBLISHED),
+        (PublishState.PUBLISHING, PublishState.FAILED),
+        (PublishState.PUBLISHING, PublishState.PARTIAL_FAILED),
+        (PublishState.UNCERTAIN, PublishState.PENDING),
+        (PublishState.UNCERTAIN, PublishState.PUBLISHED),
+        (PublishState.PARTIAL_FAILED, PublishState.PUBLISHED),
+        (PublishState.PARTIAL_FAILED, PublishState.FAILED),
+        (PublishState.FAILED, PublishState.PENDING),
+    ])
+    def test_legal_transitions_are_allowed(self, current, target):
+        assert_publish_transition(current, target)
+
+    @pytest.mark.parametrize("current,target", [
+        # Acceptance can never skip straight past the request.
+        (PublishState.PENDING, PublishState.SUBMITTED),
+        (PublishState.PENDING, PublishState.PUBLISHED),
+        # Published is final: nothing may quietly re-open it.
+        (PublishState.PUBLISHED, PublishState.PENDING),
+        (PublishState.PUBLISHED, PublishState.IN_FLIGHT),
+        (PublishState.CANCELED, PublishState.PENDING),
+    ])
+    def test_illegal_transitions_are_rejected_loudly(self, current, target):
+        with pytest.raises(TransitionError):
+            assert_publish_transition(current, target)
+
+    def test_a_partial_failure_can_never_go_back_to_pending(self):
+        """Re-queuing a partial would duplicate the platforms that succeeded."""
+        with pytest.raises(TransitionError):
+            assert_publish_transition(PublishState.PARTIAL_FAILED, PublishState.PENDING)
+
+    def test_the_db_enforces_the_machine(self, db):
+        source_id, _ = db.upsert_source(make_source())
+        clip_id = db.upsert_clip(GeneratedClip(source_id=source_id, job_id="j",
+                                               clip_index=0, filename="a.mp4"))
+        attempt_id = db.reserve_publish_attempt(PublishAttempt(
+            clip_id=clip_id, source_id=source_id, job_id="j", clip_index=0,
+            idempotency_key="k", platforms=["tiktok"]))
+        with pytest.raises(TransitionError):
+            db.set_publish_state(attempt_id, PublishState.PUBLISHED)
+
+    def test_compare_and_set_blocks_a_racing_writer(self, db):
+        """A status poll and an operator action must not both land."""
+        source_id, _ = db.upsert_source(make_source())
+        clip_id = db.upsert_clip(GeneratedClip(source_id=source_id, job_id="j",
+                                               clip_index=0, filename="a.mp4"))
+        attempt_id = db.reserve_publish_attempt(PublishAttempt(
+            clip_id=clip_id, source_id=source_id, job_id="j", clip_index=0,
+            idempotency_key="k", platforms=["tiktok"]))
+        db.set_publish_state(attempt_id, PublishState.IN_FLIGHT)
+        assert db.set_publish_state(attempt_id, PublishState.SUBMITTED,
+                                    expected=[PublishState.IN_FLIGHT])
+        # The loser believed it was still IN_FLIGHT and is refused.
+        assert not db.set_publish_state(attempt_id, PublishState.UNCERTAIN,
+                                        expected=[PublishState.IN_FLIGHT])
+        assert db.get_publish_attempt(attempt_id).state == PublishState.SUBMITTED
+
+    def test_terminal_states_stop_being_polled(self, db):
+        source_id, _ = db.upsert_source(make_source())
+        clip_id = db.upsert_clip(GeneratedClip(source_id=source_id, job_id="j",
+                                               clip_index=0, filename="a.mp4"))
+        attempt_id = db.reserve_publish_attempt(PublishAttempt(
+            clip_id=clip_id, source_id=source_id, job_id="j", clip_index=0,
+            idempotency_key="k", platforms=["tiktok"]))
+        db.set_publish_state(attempt_id, PublishState.IN_FLIGHT)
+        db.set_publish_state(attempt_id, PublishState.SUBMITTED,
+                             vendor_job_id="job_1",
+                             next_status_check_at=iso(utcnow() - timedelta(minutes=1)))
+        assert len(db.attempts_due_for_status_check(utcnow())) == 1
+        db.set_publish_state(attempt_id, PublishState.PUBLISHED)
+        assert db.attempts_due_for_status_check(utcnow()) == []

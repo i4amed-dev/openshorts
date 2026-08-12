@@ -11,8 +11,9 @@ import httpx
 import pytest
 
 from automation.youtube_client import (
-    COST_SEARCH_LIST, COST_VIDEOS_LIST, QuotaExhausted, YouTubeClient, YouTubeError,
-    is_valid_video_id, parse_iso8601_duration, parse_video_item, quota_reset_time,
+    BUCKET_GENERAL, BUCKET_SEARCH, COST_SEARCH_LIST, COST_VIDEOS_LIST, QuotaExhausted,
+    YouTubeClient, YouTubeError, is_valid_video_id, parse_iso8601_duration,
+    parse_video_item, quota_reset_time,
 )
 from autopilot_fakes import run_async
 
@@ -159,7 +160,7 @@ class TestQuotaAndRetries:
         assert len(run_async(scenario())) == 1
 
     def test_units_are_reported_only_for_successful_calls(self):
-        spent = []
+        spent = []   # (units, bucket)
         calls = {"n": 0}
 
         def handler(request):
@@ -170,26 +171,88 @@ class TestQuotaAndRetries:
 
         async def scenario():
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-                client = YouTubeClient("k", client=http, max_retries=3, on_units=spent.append)
+                client = YouTubeClient("k", client=http, max_retries=3,
+                                       on_units=lambda u, b: spent.append((u, b)))
                 client._backoff = _no_sleep
                 await client.most_popular()
 
         run_async(scenario())
-        assert spent == [COST_VIDEOS_LIST]
+        assert spent == [(COST_VIDEOS_LIST, BUCKET_GENERAL)]
 
-    def test_search_costs_a_hundred_units(self):
+    def test_search_bills_its_own_bucket_not_the_general_pool(self):
+        """The quota model corrected in this pass.
+
+        Since 1-jun-2026 search.list costs 1 unit against a dedicated ~100
+        calls/day allocation. The old model charged 100 units to the shared
+        10,000 pool, which both overstated general usage and let a search
+        exhaustion disable chart discovery.
+        """
         spent = []
+        captured = {}
 
         def handler(request):
+            captured["params"] = dict(request.url.params)
             return httpx.Response(200, json={"items": [{"id": {"videoId": "dQw4w9WgXcQ"}}]})
 
         async def scenario():
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-                client = YouTubeClient("k", client=http, on_units=spent.append)
+                client = YouTubeClient("k", client=http,
+                                       on_units=lambda u, b: spent.append((u, b)))
                 return await client.search_video_ids("cooking")
 
         assert run_async(scenario()) == ["dQw4w9WgXcQ"]
-        assert spent == [COST_SEARCH_LIST]
+        assert spent == [(1, BUCKET_SEARCH)]
+        assert COST_SEARCH_LIST == 1
+
+    def test_search_requests_the_currently_required_part(self):
+        """search.list documents `part=snippet` as required; `part=id` is not accepted."""
+        captured = {}
+
+        def handler(request):
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json={"items": []})
+
+        async def scenario():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+                await YouTubeClient("k", client=http).search_video_ids("cooking")
+
+        run_async(scenario())
+        assert captured["params"]["part"] == "snippet"
+        assert captured["params"]["type"] == "video"
+
+    def test_creative_commons_filter_is_sent_only_when_asked(self):
+        captured = []
+
+        def handler(request):
+            captured.append(dict(request.url.params))
+            return httpx.Response(200, json={"items": []})
+
+        async def scenario():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+                client = YouTubeClient("k", client=http)
+                await client.search_video_ids("x", creative_commons=True)
+                await client.search_video_ids("x", creative_commons=False)
+
+        run_async(scenario())
+        assert captured[0].get("videoLicense") == "creativeCommon"
+        assert "videoLicense" not in captured[1]
+
+    def test_quota_exhaustion_names_its_bucket(self):
+        def handler(request):
+            return httpx.Response(403, json={"error": {"errors": [
+                {"reason": "quotaExceeded"}]}})
+
+        async def scenario():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+                client = YouTubeClient("k", client=http)
+                with pytest.raises(QuotaExhausted) as exc:
+                    await client.search_video_ids("x")
+                assert exc.value.bucket == BUCKET_SEARCH
+                with pytest.raises(QuotaExhausted) as exc2:
+                    await client.most_popular()
+                assert exc2.value.bucket == BUCKET_GENERAL
+
+        run_async(scenario())
 
     def test_pagination_is_bounded(self):
         # Every page hands back a nextPageToken; the client must still stop.

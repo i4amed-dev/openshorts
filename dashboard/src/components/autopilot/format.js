@@ -106,13 +106,45 @@ export function explainReason(reason) {
 export const STATE_TONE = {
     DISCOVERED: 'muted', ELIGIBLE: 'brass', SELECTED: 'brass',
     PROCESS_QUEUED: 'brass', PROCESSING: 'brass', PROCESS_READY: 'brass',
-    CLIPS_SCHEDULED: 'ok', DONE: 'ok',
+    CLIPS_SCHEDULED: 'brass', DONE: 'ok',
     FILTERED: 'muted', SKIPPED: 'muted',
     PROCESS_FAILED: 'warn', FAILED: 'danger',
-    PENDING: 'brass', IN_FLIGHT: 'brass', SCHEDULED: 'brass',
-    SUBMITTED: 'ok', PUBLISHED: 'ok',
+    // Publish lifecycle. SUBMITTED is deliberately NOT green: the vendor has
+    // accepted the job, nothing is live yet, and colouring it as success is
+    // exactly the lie this pass removed.
+    PENDING: 'muted', IN_FLIGHT: 'brass', SCHEDULED: 'brass',
+    SUBMITTED: 'brass', PUBLISHING: 'brass',
+    PUBLISHED: 'ok', PARTIAL: 'warn', PARTIAL_FAILED: 'warn',
     UNCERTAIN: 'warn', CANCELED: 'muted',
 };
+
+// What each publish state means in the operator's language. "Submitted" alone
+// reads as done; "scheduled with Upload-Post" does not.
+export const PUBLISH_LABEL = {
+    PENDING: 'queued locally',
+    IN_FLIGHT: 'uploading',
+    SUBMITTED: 'scheduled with upload-post',
+    PUBLISHING: 'publishing now',
+    PUBLISHED: 'published',
+    PARTIAL_FAILED: 'partial failure',
+    FAILED: 'failed',
+    UNCERTAIN: 'needs attention',
+    CANCELED: 'canceled',
+};
+
+export const PUBLISH_EXPLAINER = {
+    SUBMITTED: 'Upload-Post has accepted this post and will publish it at its slot. '
+        + 'Nothing is live yet.',
+    PUBLISHING: 'Upload-Post is pushing this to the platforms right now.',
+    PUBLISHED: 'Upload-Post confirmed every selected platform succeeded.',
+    PARTIAL_FAILED: 'Live on some platforms and failed on others. Klippo will not resend it — '
+        + 'that would post it twice where it already succeeded.',
+    UNCERTAIN: 'The outcome is unknown. Klippo will not resend it on its own.',
+};
+
+export function publishLabel(state) {
+    return PUBLISH_LABEL[state] || (state || '').replace(/_/g, ' ').toLowerCase();
+}
 
 export function badgeClass(state) {
     const tone = STATE_TONE[state] || 'muted';

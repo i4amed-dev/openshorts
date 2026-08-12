@@ -77,7 +77,6 @@ DEFAULTS: Dict[str, Any] = {
         "max_candidates_per_run": 50,
         "channel_allowlist": [],
         "channel_denylist": [],
-        "creative_commons_search_only": True,
     },
     "eligibility": {
         "min_duration_seconds": 180,
@@ -264,8 +263,12 @@ def normalise(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                                           lo=5, hi=200, field="discovery.max_candidates_per_run")
     d["channel_allowlist"] = _as_str_list(src.get("channel_allowlist"), default=[], max_items=200)
     d["channel_denylist"] = _as_str_list(src.get("channel_denylist"), default=[], max_items=200)
-    d["creative_commons_search_only"] = _as_bool(src.get("creative_commons_search_only"),
-                                                 default=True)
+    # `creative_commons_search_only` was removed in this pass: it could
+    # contradict rights.policy (an owned-channels policy plus a stale CC-only
+    # search flag hid the operator's own standard-licence videos). The search
+    # filter is now derived from the policy — see
+    # eligibility.search_requires_creative_commons. Old values are dropped
+    # silently by normalise(), which keeps every other setting intact.
     if "niche_search" in d["strategies"] and not d["topics"]:
         raise ConfigError("The niche search strategy needs at least one topic/keyword")
 

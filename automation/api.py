@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from .config import ConfigError
-from .service import get_service
+from .service import PreflightError, get_service
 
 router = APIRouter(prefix="/api/autopilot", tags=["autopilot"])
 
@@ -50,16 +50,44 @@ async def put_settings(request: Request):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@router.get("/preflight")
+async def preflight():
+    """Dry-run the enable checks so the UI can show them before anyone clicks."""
+    return await _service().preflight()
+
+
 @router.post("/enable")
 async def enable():
     try:
-        config = _service().enable()
+        config = await _service().enable()
     except ConfigError as exc:
-        # Enabling with an incomplete configuration (no topics for niche search,
-        # no allowlisted channels for the owned-channels policy) must fail here
-        # rather than at 03:00 with nobody watching.
         raise HTTPException(status_code=400, detail=str(exc))
+    except PreflightError as exc:
+        # Structured, not a string: the UI lists each failed check so the
+        # operator can fix the specific thing rather than guess.
+        raise HTTPException(status_code=409, detail={
+            "error": "preflight_failed",
+            "message": "Autopilot cannot start yet.",
+            **exc.report,
+        })
     return {"enabled": True, "settings": config}
+
+
+@router.get("/profiles")
+async def upload_post_profiles():
+    """Upload-Post profiles on the server key: usernames + linked platforms.
+
+    Never returns the API key. The setup UI uses this for the profile picker and
+    to stop the operator selecting a platform the profile cannot post to.
+    """
+    from publishing_service import PublishError
+    try:
+        return {"profiles": await _service().list_upload_post_profiles()}
+    except PublishError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502,
+                            detail=f"Could not reach Upload-Post: {exc}")
 
 
 @router.post("/disable")
@@ -82,7 +110,7 @@ async def resume():
 
 @router.post("/emergency-stop")
 async def emergency_stop():
-    return _service().emergency_stop()
+    return await _service().emergency_stop()
 
 
 @router.post("/discover")
@@ -150,9 +178,21 @@ async def force_retry_publish(attempt_id: int):
 
 @router.post("/publishes/{attempt_id}/resolve")
 async def resolve_publish(attempt_id: int):
-    """Close out an UNCERTAIN attempt the operator verified on the calendar."""
+    """Operator verified an uncertain/partial attempt IS live. Marks it published."""
     if not _service().resolve_uncertain(attempt_id):
-        raise HTTPException(status_code=409, detail="This attempt is not uncertain")
+        raise HTTPException(
+            status_code=409,
+            detail="Only an uncertain or partially-failed attempt can be resolved")
+    return {"ok": True}
+
+
+@router.post("/publishes/{attempt_id}/abandon")
+async def abandon_publish(attempt_id: int):
+    """Stop chasing an uncertain/partial attempt without resending anything."""
+    if not _service().abandon_attempt(attempt_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Only an uncertain or partially-failed attempt can be abandoned")
     return {"ok": True}
 
 

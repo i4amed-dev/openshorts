@@ -6,7 +6,8 @@ import {
 } from 'lucide-react';
 import ScoreBreakdown from './ScoreBreakdown';
 import {
-    badgeClass, explainReason, fmtCount, fmtDuration, fmtInZone, relative,
+    PUBLISH_EXPLAINER, badgeClass, explainReason, fmtCount, fmtDuration, fmtInZone,
+    publishLabel, relative,
 } from './format';
 
 /**
@@ -146,83 +147,167 @@ function SourceRow({ source, onSkip, onRetry, busy }) {
     );
 }
 
-function PublishRow({ attempt, timezone, onRetry, onForceRetry, onResolve, busy }) {
-    return (
-        <div className="flex items-start gap-3 py-3 border-b border-rule last:border-0">
-            <div className="shrink-0 mt-0.5">
-                {attempt.state === 'SUBMITTED' && <CheckCircle2 size={15} className="text-ok" />}
-                {attempt.state === 'PENDING' && <Circle size={15} className="text-muted" />}
-                {attempt.state === 'IN_FLIGHT' && (
-                    <Loader2 size={15} className="text-brass animate-spin" />
-                )}
-                {attempt.state === 'FAILED' && <XCircle size={15} className="text-danger" />}
-                {attempt.state === 'UNCERTAIN' && (
-                    <AlertTriangle size={15} className="text-warn" />
-                )}
-                {attempt.state === 'CANCELED' && <XCircle size={15} className="text-muted" />}
-            </div>
+function PublishRow({ attempt, timezone, onRetry, onForceRetry, onResolve, onAbandon, busy }) {
+    const [open, setOpen] = useState(false);
+    const state = attempt.state;
+    const results = attempt.vendor_results || [];
+    const needsAttention = state === 'UNCERTAIN' || state === 'PARTIAL_FAILED';
 
-            <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2 flex-wrap">
-                    <span className="text-sm text-ink truncate max-w-[24rem]">
-                        {attempt.title || `clip ${attempt.clip_index + 1}`}
-                    </span>
-                    <span className={badgeClass(attempt.state)}>
-                        {attempt.state.replace(/_/g, ' ').toLowerCase()}
-                    </span>
+    return (
+        <div className="py-3 border-b border-rule last:border-0">
+            <div className="flex items-start gap-3">
+                <div className="shrink-0 mt-0.5">
+                    {state === 'PUBLISHED' && <CheckCircle2 size={15} className="text-ok" />}
+                    {state === 'PENDING' && <Circle size={15} className="text-muted" />}
+                    {(state === 'IN_FLIGHT' || state === 'PUBLISHING') && (
+                        <Loader2 size={15} className="text-brass animate-spin" />
+                    )}
+                    {state === 'SUBMITTED' && <Clock size={15} className="text-brass" />}
+                    {state === 'FAILED' && <XCircle size={15} className="text-danger" />}
+                    {(state === 'UNCERTAIN' || state === 'PARTIAL_FAILED') && (
+                        <AlertTriangle size={15} className="text-warn" />
+                    )}
+                    {state === 'CANCELED' && <XCircle size={15} className="text-muted" />}
                 </div>
-                <div className="flex items-center gap-3 mt-1 flex-wrap">
-                    <span className="readout">
-                        {fmtInZone(attempt.scheduled_for_utc, attempt.timezone || timezone)}
-                    </span>
-                    <span className="readout">{attempt.platforms.join(' · ')}</span>
-                    {attempt.retry_count > 0 && (
-                        <span className="readout text-warn">{attempt.retry_count} retries</span>
+
+                <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-sm text-ink truncate max-w-[22rem]">
+                            {attempt.title || `clip ${attempt.clip_index + 1}`}
+                        </span>
+                        <span className={badgeClass(state)}>{publishLabel(state)}</span>
+                    </div>
+                    <div className="flex items-center gap-3 mt-1 flex-wrap">
+                        <span className="readout">
+                            {fmtInZone(attempt.scheduled_for_utc, attempt.timezone || timezone)}
+                        </span>
+                        <span className="readout">{(attempt.platforms || []).join(' · ')}</span>
+                        {attempt.retry_count > 0 && (
+                            <span className="readout text-warn">{attempt.retry_count} retries</span>
+                        )}
+                        {attempt.vendor_tracking_id && (
+                            <span className="readout">id {attempt.vendor_tracking_id}</span>
+                        )}
+                        {attempt.last_status_check_at && (
+                            <span className="readout">
+                                checked {relative(attempt.last_status_check_at)}
+                            </span>
+                        )}
+                    </div>
+
+                    {PUBLISH_EXPLAINER[state] && (
+                        <p className="text-xs text-muted mt-1.5 leading-relaxed">
+                            {PUBLISH_EXPLAINER[state]}
+                        </p>
+                    )}
+
+                    {/* Per-platform outcomes: the only honest way to show a
+                        multi-platform post, where one network can fail alone. */}
+                    {results.length > 0 && (
+                        <div className="flex flex-wrap gap-2 mt-2">
+                            {results.map((r) => (
+                                <span
+                                    key={r.platform}
+                                    className={`readout px-2 py-0.5 rounded-input ${
+                                        r.status === 'completed' ? 'text-ok bg-ok/10'
+                                            : r.status === 'failed' ? 'text-danger bg-danger/10'
+                                            : 'text-muted bg-paper3'}`}
+                                    title={r.message || r.status}
+                                >
+                                    {r.platform} · {r.status}
+                                </span>
+                            ))}
+                        </div>
+                    )}
+
+                    {attempt.error && (
+                        <p className="text-xs text-danger mt-1.5 break-words">{attempt.error}</p>
+                    )}
+
+                    {needsAttention && (
+                        <div className="mt-2 p-3 bg-warn/10 rounded-input">
+                            <p className="text-xs text-warn leading-relaxed">
+                                {state === 'PARTIAL_FAILED' ? (
+                                    <>
+                                        This went live on <strong>
+                                            {results.filter((r) => r.status === 'completed')
+                                                .map((r) => r.platform).join(', ') || 'some platforms'}
+                                        </strong> and failed on <strong>
+                                            {results.filter((r) => r.status === 'failed')
+                                                .map((r) => r.platform).join(', ') || 'others'}
+                                        </strong>. Resending would publish it twice where it
+                                        already succeeded, so Klippo will not retry.
+                                        Post the failed platform by hand, then close this out.
+                                    </>
+                                ) : (
+                                    <>
+                                        Klippo could not establish what happened to this post.
+                                        Check your Upload-Post calendar before deciding —
+                                        it will not resend on its own.
+                                    </>
+                                )}
+                            </p>
+                            <div className="flex flex-wrap gap-2 mt-2">
+                                <button onClick={() => onResolve(attempt)} disabled={busy}
+                                    className="btn-quiet px-3 py-1.5 text-xs">
+                                    it is live — mark published
+                                </button>
+                                {state === 'UNCERTAIN' && (
+                                    <button onClick={() => onForceRetry(attempt)} disabled={busy}
+                                        className="btn-quiet px-3 py-1.5 text-xs">
+                                        it never posted — send again
+                                    </button>
+                                )}
+                                <button onClick={() => onAbandon(attempt)} disabled={busy}
+                                    className="btn-quiet px-3 py-1.5 text-xs">
+                                    give up on it
+                                </button>
+                            </div>
+                        </div>
                     )}
                 </div>
-                {attempt.error && (
-                    <p className="text-xs text-danger mt-1 break-words">{attempt.error}</p>
-                )}
 
-                {attempt.state === 'UNCERTAIN' && (
-                    <div className="mt-2 p-3 bg-warn/10 rounded-input">
-                        <p className="text-xs text-warn leading-relaxed">
-                            The upload was interrupted and Upload-Post never confirmed it.
-                            Check your calendar: this clip may already be scheduled.
-                            Klippo will not retry on its own, because that could post it twice.
-                        </p>
-                        <div className="flex flex-wrap gap-2 mt-2">
-                            <button
-                                onClick={() => onResolve(attempt)}
-                                disabled={busy}
-                                className="btn-quiet px-3 py-1.5 text-xs"
-                            >
-                                it is on the calendar
-                            </button>
-                            <button
-                                onClick={() => onForceRetry(attempt)}
-                                disabled={busy}
-                                className="btn-quiet px-3 py-1.5 text-xs"
-                            >
-                                it is not — send it again
-                            </button>
-                        </div>
-                    </div>
-                )}
+                <div className="shrink-0 flex flex-col items-end gap-1">
+                    {state === 'FAILED' && (
+                        <button onClick={() => onRetry(attempt)} disabled={busy}
+                            className="btn-quiet px-3 py-1.5 text-xs">
+                            <RefreshCw size={12} /> retry
+                        </button>
+                    )}
+                    {(attempt.vendor_status || attempt.next_status_check_at) && (
+                        <button onClick={() => setOpen(!open)}
+                            className="readout hover:text-ink transition-colors">
+                            {open ? 'less' : 'details'}
+                        </button>
+                    )}
+                </div>
             </div>
 
-            {attempt.state === 'FAILED' && (
-                <button
-                    onClick={() => onRetry(attempt)}
-                    disabled={busy}
-                    className="btn-quiet px-3 py-1.5 text-xs shrink-0"
-                >
-                    <RefreshCw size={12} /> retry
-                </button>
+            {open && (
+                <div className="mt-2 ml-8 flex flex-wrap gap-x-4 gap-y-1 animate-fade">
+                    {attempt.vendor_status && (
+                        <span className="readout">vendor says: {attempt.vendor_status}</span>
+                    )}
+                    {attempt.vendor_is_scheduled && (
+                        <span className="readout">held as a scheduled job</span>
+                    )}
+                    {attempt.next_status_check_at && (
+                        <span className="readout">
+                            next check {relative(attempt.next_status_check_at)}
+                        </span>
+                    )}
+                    {attempt.submitted_at && (
+                        <span className="readout">accepted {relative(attempt.submitted_at)}</span>
+                    )}
+                    {attempt.finalized_at && (
+                        <span className="readout">settled {relative(attempt.finalized_at)}</span>
+                    )}
+                </div>
             )}
         </div>
     );
 }
+
 
 export default function AutopilotOps({ status, busy, action, onOpenSetup }) {
     const [confirm, setConfirm] = useState(null);
@@ -369,8 +454,10 @@ export default function AutopilotOps({ status, busy, action, onOpenSetup }) {
                 <div className="flex-1" />
                 <button
                     onClick={() => confirmThen(
-                        'Emergency stop turns Autopilot off and cancels every post it has not sent yet. '
-                        + 'Posts already accepted by Upload-Post stay on your calendar — cancel those there.',
+                        'Emergency stop turns Autopilot off, drops everything still queued here, and asks '
+                        + 'Upload-Post to cancel the future posts it is holding for Klippo. Anything already '
+                        + 'published stays published, and a post whose slot has passed is re-checked rather '
+                        + 'than assumed cancelled. Manual posts are never touched.',
                         'emergency-stop')}
                     disabled={busy}
                     className="btn-danger px-3 py-2 text-xs">
@@ -384,7 +471,7 @@ export default function AutopilotOps({ status, busy, action, onOpenSetup }) {
                     <Calendar size={15} className="text-brass" />
                     <h3 className="text-sm text-ink lowercase">scheduled &amp; published</h3>
                     <span className="readout ml-auto">
-                        {today.posts_submitted ?? 0} submitted today
+                        {today.posts_published ?? 0} published · {today.posts_submitted ?? 0} accepted today
                     </span>
                 </div>
                 {status.publish_attempts?.length ? (
@@ -401,6 +488,10 @@ export default function AutopilotOps({ status, busy, action, onOpenSetup }) {
                                     + 'Sending again when it already exists will publish the clip twice.',
                                     'force-retry-publish', a.id)}
                                 onResolve={(a) => run('resolve-publish', a.id)}
+                                onAbandon={(a) => confirmThen(
+                                    'This stops Klippo tracking the post. Anything already live stays live — '
+                                    + 'nothing is removed from any platform.',
+                                    'abandon-publish', a.id)}
                             />
                         ))}
                     </div>
@@ -515,13 +606,24 @@ export default function AutopilotOps({ status, busy, action, onOpenSetup }) {
                     )) : <p className="text-xs text-muted">No activity recorded yet.</p>}
                 </div>
                 <div className="mt-4 pt-3 border-t border-rule flex flex-wrap gap-x-4 gap-y-1">
+                    {/* Two independent YouTube allocations — running out of one
+                        does not stop the other, so they are shown separately. */}
                     <span className="readout">
-                        youtube quota {status.youtube_quota?.units_used_today ?? 0}
-                        /{status.youtube_quota?.daily_budget ?? '?'} units
+                        api units {status.youtube_quota?.general_units_used ?? 0}
+                        /{status.youtube_quota?.general_budget ?? '?'}
                     </span>
-                    {status.youtube_quota?.blocked_until && (
+                    <span className="readout">
+                        search queries {status.youtube_quota?.search_calls_used ?? 0}
+                        /{status.youtube_quota?.search_budget ?? '?'}
+                    </span>
+                    {status.youtube_quota?.general_blocked_until && (
                         <span className="readout text-warn">
-                            quota exhausted until {fmtInZone(status.youtube_quota.blocked_until, tz)}
+                            api quota blocked until {fmtInZone(status.youtube_quota.general_blocked_until, tz)}
+                        </span>
+                    )}
+                    {status.youtube_quota?.search_blocked_until && (
+                        <span className="readout text-warn">
+                            search blocked until {fmtInZone(status.youtube_quota.search_blocked_until, tz)}
                         </span>
                     )}
                     {status.storage?.available && (

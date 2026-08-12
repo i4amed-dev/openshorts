@@ -13,7 +13,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import eligibility, ranking
 from .db import AutopilotDB, iso, utcnow
 from .models import DiscoveredSource, Reason, SourceState
-from .youtube_client import QuotaExhausted, VideoRecord, YouTubeClient, YouTubeError
+from .youtube_client import (
+    BUCKET_GENERAL, BUCKET_SEARCH, QuotaExhausted, VideoRecord, YouTubeClient, YouTubeError,
+)
 
 
 class DiscoveryResult(dict):
@@ -21,7 +23,9 @@ class DiscoveryResult(dict):
 
 
 async def fetch_candidates(client: YouTubeClient, config: Dict[str, Any], *,
-                           now: Optional[datetime] = None) -> List[VideoRecord]:
+                           now: Optional[datetime] = None,
+                           allow_search: bool = True,
+                           allow_general: bool = True) -> List[VideoRecord]:
     """Run the configured strategies and return de-duplicated candidates.
 
     Strategy A (``most_popular``) is 1 quota unit per 50 videos and tells us what
@@ -38,7 +42,7 @@ async def fetch_candidates(client: YouTubeClient, config: Dict[str, Any], *,
 
     collected: Dict[str, VideoRecord] = {}
 
-    if "most_popular" in strategies:
+    if "most_popular" in strategies and allow_general:
         categories = discovery.get("category_ids") or [""]
         per_category = max(5, budget // max(1, len(categories)))
         for category_id in categories[:5]:
@@ -50,10 +54,11 @@ async def fetch_candidates(client: YouTubeClient, config: Dict[str, Any], *,
             for record in records:
                 collected.setdefault(record.video_id, record)
 
-    if "niche_search" in strategies:
+    if "niche_search" in strategies and allow_search:
         topics = discovery.get("topics") or []
         published_after = now - timedelta(hours=max_age_hours)
-        cc_only = bool(discovery.get("creative_commons_search_only", True))
+        # Derived from the rights policy — never a second, contradictable switch.
+        cc_only = eligibility.search_requires_creative_commons(config.get("rights") or {})
         # search.list returns ids only, so each topic costs 100 units plus one
         # cheap videos.list batch to hydrate statistics/contentDetails/status.
         for topic in topics[:8]:
@@ -162,18 +167,46 @@ async def run_discovery(db: AutopilotDB, config: Dict[str, Any], client: YouTube
     """One complete discovery pass. Never raises for quota — parks instead."""
     now = now or utcnow()
     db.start_run(run_id, "discovery")
+
+    # Buckets are independent, so an exhausted search allocation must not stop
+    # chart discovery — that pool may still have thousands of units.
+    allow_search = db.quota_blocked(now, bucket=BUCKET_SEARCH) is None
+    allow_general = db.quota_blocked(now, bucket=BUCKET_GENERAL) is None
+
+    # Park only when nothing the operator actually enabled can run. Chart
+    # discovery needs the general pool; niche search needs the search
+    # allocation. Exhausting one leaves the other perfectly usable.
+    strategies = (config.get("discovery") or {}).get("strategies") or []
+    runnable = ((("most_popular" in strategies) and allow_general)
+                or (("niche_search" in strategies) and allow_search))
+    if not runnable:
+        blocked = "search" if "niche_search" in strategies and not allow_search else "general"
+        db.log_event("discovery",
+                     f"Skipped — the {blocked} YouTube quota bucket is exhausted and no "
+                     f"enabled strategy can run without it",
+                     level="warn", run_id=run_id)
+        db.finish_run(run_id, "FAILED", {"quota_exhausted": True, "bucket": blocked},
+                      "No discovery strategy can run within the available quota")
+        return DiscoveryResult(candidates=0, stored=0, duplicates=0, eligible=0,
+                               rejected=0, quota_exhausted=True, bucket=blocked)
+
     try:
-        records = await fetch_candidates(client, config, now=now)
+        records = await fetch_candidates(client, config, now=now,
+                                         allow_search=allow_search,
+                                         allow_general=allow_general)
     except QuotaExhausted as exc:
         from .youtube_client import quota_reset_time
         reset = quota_reset_time(now)
-        db.mark_quota_exhausted(reset, str(exc))
-        db.log_event("discovery", "YouTube quota exhausted — discovery parked until reset",
+        bucket = getattr(exc, "bucket", BUCKET_GENERAL)
+        db.mark_quota_exhausted(reset, str(exc), bucket=bucket)
+        db.log_event("discovery",
+                     f"YouTube {bucket} quota exhausted — that strategy is parked "
+                     f"until the reset; the other bucket keeps working",
                      level="warn", run_id=run_id,
-                     data={"reason": exc.reason, "until": iso(reset)})
-        db.finish_run(run_id, "FAILED", {"quota_exhausted": True}, str(exc))
+                     data={"reason": exc.reason, "bucket": bucket, "until": iso(reset)})
+        db.finish_run(run_id, "FAILED", {"quota_exhausted": True, "bucket": bucket}, str(exc))
         return DiscoveryResult(candidates=0, stored=0, duplicates=0, eligible=0,
-                               rejected=0, quota_exhausted=True)
+                               rejected=0, quota_exhausted=True, bucket=bucket)
     except YouTubeError as exc:
         db.log_event("discovery", f"YouTube API error: {exc}", level="error", run_id=run_id)
         db.finish_run(run_id, "FAILED", {}, str(exc))
@@ -236,13 +269,7 @@ def pick_next_source(db: AutopilotDB, config: Dict[str, Any], *,
     return None, "no_eligible_source"
 
 
-def quota_blocked_until(db: AutopilotDB, now: Optional[datetime] = None) -> Optional[datetime]:
-    from .db import parse_iso
-    now = now or utcnow()
-    quota = db.get_quota("youtube")
-    until = parse_iso(quota.get("exhausted_until"))
-    if until and until > now:
-        return until
-    if until:
-        db.clear_quota_block("youtube")
-    return None
+def quota_blocked_until(db: AutopilotDB, now: Optional[datetime] = None,
+                        bucket: str = BUCKET_GENERAL) -> Optional[datetime]:
+    """When one YouTube quota bucket frees up, or None if it is usable now."""
+    return db.quota_blocked(now or utcnow(), bucket=bucket)

@@ -1064,7 +1064,12 @@ def _autopilot_active_heavy_jobs() -> int:
 
 
 async def _autopilot_publish(**kwargs):
-    """Autopilot's publish call — the same service the manual button uses."""
+    """Autopilot's publish call — the same service the manual button uses.
+
+    Returns the vendor identifiers alongside the body: a 2xx means Upload-Post
+    accepted the job, and Autopilot needs ``request_id`` / ``job_id`` to find
+    out later whether it actually went live.
+    """
     req = publishing_service.PublishRequest(
         file_path=kwargs["file_path"],
         platforms=kwargs["platforms"],
@@ -1075,14 +1080,41 @@ async def _autopilot_publish(**kwargs):
         youtube_title=kwargs.get("title"),
         scheduled_date=kwargs.get("scheduled_date"),
         timezone=kwargs.get("timezone") or "UTC",
+        request_id=kwargs.get("request_id"),
     )
     result = await publishing_service.publish(req)
-    return result.response
+    return {"response": result.response, "request_id": result.request_id,
+            "job_id": result.job_id, "status_code": result.status_code}
 
 
 def _autopilot_credentials():
-    """Server-side Upload-Post credentials. Never returned through the API."""
-    return (os.environ.get("UPLOAD_POST_API_KEY") or None, UPLOAD_POST_USER)
+    """Server-side Upload-Post credentials for unattended publishing.
+
+    Precedence, documented in .env.example and the README:
+      * API key  — server environment ONLY. Never stored in the Autopilot
+        database, never returned by any endpoint.
+      * Profile  — Autopilot's own `publishing.upload_post_user` setting, with
+        UPLOAD_POST_USER as the fallback for a config that predates the
+        selector. A profile username is not a secret.
+    """
+    api_key = os.environ.get("UPLOAD_POST_API_KEY") or None
+    profile = None
+    if AUTOPILOT_ENABLED:
+        try:
+            from automation.service import get_service
+            profile = ((get_service().get_settings().get("publishing") or {})
+                       .get("upload_post_user"))
+        except Exception:
+            profile = None
+    return (api_key, profile or UPLOAD_POST_USER)
+
+
+async def _autopilot_list_profiles():
+    """Profiles on the server-side key. Returns names + linked platforms only."""
+    api_key = os.environ.get("UPLOAD_POST_API_KEY")
+    if not api_key:
+        return []
+    return await publishing_service.list_profiles(api_key)
 
 
 def _autopilot_register_ports():
@@ -1098,6 +1130,7 @@ def _autopilot_register_ports():
         publisher=PublisherPort(
             publish=_autopilot_publish,
             credentials=_autopilot_credentials,
+            list_profiles=_autopilot_list_profiles,
         ),
     )
 
@@ -3291,44 +3324,32 @@ async def thumbnail_publish(
     publish_id = str(uuid.uuid4())
     publish_jobs[publish_id] = {"status": "uploading", "result": None, "error": None}
 
-    def do_upload():
-        """Runs in a thread via BackgroundTasks — does the actual multipart upload."""
+    async def do_upload():
+        """Publish through the shared service, with the thumbnail as an extra part.
+
+        This used to build its own Upload-Post request — a third copy of the
+        payload, and one that read both the video AND the thumbnail fully into
+        memory. It now goes through publishing_service like every other caller;
+        the only thing special about it is the second multipart part.
+        """
         try:
-            upload_url = "https://api.upload-post.com/api/upload"
-            headers = {"Authorization": f"Apikey {upload_key}"}
-            data_payload = {
-                "user": post_user,
-                "platform[]": ["youtube"],
-                "title": title,          # required base field (fallback)
-                "async_upload": "true",
-                "youtube_title": title,
-                "youtube_description": description,
-                "privacyStatus": "public",
-            }
-            video_filename = os.path.basename(video_path)
-            thumb_filename = os.path.basename(thumb_path)
-
             print(f"📡 [Thumbnail] Publishing to YouTube via Upload-Post... (publish_id={publish_id})")
-            with open(video_path, "rb") as vf, open(thumb_path, "rb") as tf:
-                files = {
-                    "video": (video_filename, vf.read(), "video/mp4"),
-                    "thumbnail": (thumb_filename, tf.read(), "image/jpeg"),
-                }
-
-            # Use a long timeout — video uploads can take several minutes
-            with httpx.Client(timeout=600.0) as client:
-                response = client.post(upload_url, headers=headers, data=data_payload, files=files)
-
-            if response.status_code not in [200, 201, 202]:
-                err = f"Upload-Post API Error ({response.status_code}): {response.text}"
-                print(f"❌ {err}")
-                publish_jobs[publish_id]["status"] = "failed"
-                publish_jobs[publish_id]["error"] = err
-            else:
-                print(f"✅ [Thumbnail] Published successfully (publish_id={publish_id})")
-                publish_jobs[publish_id]["status"] = "done"
-                publish_jobs[publish_id]["result"] = response.json()
-
+            result = await publishing_service.publish(
+                publishing_service.PublishRequest(
+                    file_path=video_path,
+                    platforms=["youtube"],
+                    user=post_user,
+                    api_key=upload_key,
+                    title=title,
+                    description=description,
+                    youtube_title=title,
+                ),
+                timeout=600.0,   # a full-length video upload can take minutes
+                extra_files=[("thumbnail", thumb_path, "image/jpeg")],
+            )
+            print(f"✅ [Thumbnail] Accepted by Upload-Post (publish_id={publish_id})")
+            publish_jobs[publish_id]["status"] = "done"
+            publish_jobs[publish_id]["result"] = result.response
         except Exception as e:
             err = str(e)
             print(f"❌ Thumbnail Publish Background Error: {err}")

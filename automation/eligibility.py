@@ -27,6 +27,23 @@ from .youtube_client import VideoRecord
 CREATIVE_COMMONS = "creativecommon"
 
 
+def search_requires_creative_commons(rights: Dict[str, Any]) -> bool:
+    """Whether niche search may safely ask YouTube for CC-only results.
+
+    Derived from the rights policy rather than configured separately. Two
+    independent switches could contradict each other: with an owned-channels
+    policy and a stale "CC only" search flag, a standard-licence video from the
+    operator's OWN channel would be filtered out by the API before the rights
+    gate ever saw it — invisible, and impossible to debug from the dashboard.
+
+    Only CREATIVE_COMMONS_ONLY narrows the query. The allowlist policies must
+    see standard-licence videos, because for those channels the licence is not
+    what grants permission; the rights gate still has the final say either way.
+    """
+    policy = str((rights or {}).get("policy") or POLICY_CREATIVE_COMMONS)
+    return policy == POLICY_CREATIVE_COMMONS
+
+
 def check_rights(record: VideoRecord, rights: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     """Apply the configured Source Rights Policy. Returns (allowed, reason).
 

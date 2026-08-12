@@ -1,8 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
-    AlertTriangle, Check, ChevronDown, ChevronRight, Loader2, Save, Shield,
+    AlertTriangle, Check, ChevronDown, ChevronRight, Link2, Loader2, RefreshCw,
+    Save, Shield, X,
 } from 'lucide-react';
 import SegmentedControl from '../ui/SegmentedControl';
+import { apiJson } from '../../lib/api';
 
 /**
  * Autopilot configuration.
@@ -150,8 +152,24 @@ export default function AutopilotSetup({ settings, onSave, saving, error, onDone
     const [draft, setDraft] = useState(settings);
     const [advanced, setAdvanced] = useState(false);
     const [savedAt, setSavedAt] = useState(null);
+    const [profiles, setProfiles] = useState(null);
+    const [profileError, setProfileError] = useState('');
 
     useEffect(() => { setDraft(settings); }, [settings]);
+
+    const loadProfiles = useCallback(async () => {
+        setProfileError('');
+        try {
+            const data = await apiJson('/api/autopilot/profiles');
+            setProfiles(data.profiles || []);
+        } catch (e) {
+            setProfiles([]);
+            setProfileError(e.detail
+                || 'Could not reach Upload-Post. Check UPLOAD_POST_API_KEY in the backend .env.');
+        }
+    }, []);
+
+    useEffect(() => { loadProfiles(); }, [loadProfiles]);
 
     if (!draft) {
         return (
@@ -180,6 +198,12 @@ export default function AutopilotSetup({ settings, onSave, saving, error, onDone
 
     const needsChannels = draft.rights.policy !== 'CREATIVE_COMMONS_ONLY';
     const usesNiche = draft.discovery.strategies.includes('niche_search');
+    const selectedProfile = (profiles || []).find(
+        (p) => p.username === draft.publishing.upload_post_user);
+    const connected = selectedProfile ? (selectedProfile.connected || []) : null;
+    const unavailable = connected
+        ? draft.publishing.platforms.filter((p) => !connected.includes(p))
+        : [];
 
     return (
         <div className="space-y-5">
@@ -415,19 +439,110 @@ export default function AutopilotSetup({ settings, onSave, saving, error, onDone
             <section className="card p-5">
                 <h3 className="text-sm text-ink lowercase mb-4">what to publish</h3>
 
-                <Field label="platforms">
+                {/* Upload-Post owns the social connections. Klippo never asks
+                    for YouTube/Instagram/TikTok credentials — it only needs to
+                    know which profile to post as, and what that profile can
+                    actually reach. */}
+                <Field
+                    label="upload-post profile"
+                    hint="Your social accounts are connected inside Upload-Post. Klippo just
+                          needs to know which profile to publish as."
+                >
+                    {profileError ? (
+                        <div className="p-3 bg-warn/10 rounded-input flex items-start gap-2">
+                            <AlertTriangle size={14} className="text-warn mt-0.5 shrink-0" />
+                            <div className="min-w-0">
+                                <p className="text-xs text-warn">{profileError}</p>
+                                <button type="button" onClick={loadProfiles}
+                                    className="btn-quiet px-3 py-1.5 text-xs mt-2">
+                                    <RefreshCw size={12} /> try again
+                                </button>
+                            </div>
+                        </div>
+                    ) : profiles === null ? (
+                        <div className="flex items-center gap-2 text-xs text-muted">
+                            <Loader2 size={13} className="animate-spin" /> loading profiles…
+                        </div>
+                    ) : profiles.length === 0 ? (
+                        <p className="text-xs text-muted">
+                            No profiles found on this Upload-Post key. Create one at
+                            app.upload-post.com and connect your accounts there.
+                        </p>
+                    ) : (
+                        <div className="space-y-2">
+                            {profiles.map((profile) => {
+                                const active = draft.publishing.upload_post_user === profile.username;
+                                return (
+                                    <button
+                                        key={profile.username}
+                                        type="button"
+                                        onClick={() => set('publishing.upload_post_user',
+                                            profile.username)}
+                                        className={`w-full text-left p-3 rounded-input border transition-colors ${
+                                            active ? 'border-brass bg-paper3'
+                                                   : 'border-rule hover:border-rule2'}`}
+                                    >
+                                        <div className="flex items-center gap-2">
+                                            <Link2 size={13} className={active ? 'text-brass' : 'text-muted'} />
+                                            <span className={`text-sm ${active ? 'text-ink' : 'text-ink2'}`}>
+                                                {profile.username}
+                                            </span>
+                                            {active && <Check size={13} className="text-brass" />}
+                                        </div>
+                                        <div className="flex flex-wrap gap-3 mt-1.5 ml-5">
+                                            {['tiktok', 'instagram', 'youtube'].map((plat) => {
+                                                const on = (profile.connected || []).includes(plat);
+                                                return (
+                                                    <span key={plat}
+                                                        className={`readout flex items-center gap-1 ${
+                                                            on ? 'text-ok' : 'text-muted opacity-60'}`}>
+                                                        {on ? <Check size={10} /> : <X size={10} />}
+                                                        {plat}
+                                                    </span>
+                                                );
+                                            })}
+                                        </div>
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    )}
+                </Field>
+
+                <Field
+                    label="platforms"
+                    hint={connected
+                        ? 'Only platforms the selected profile has connected can be chosen.'
+                        : 'Select a profile above to see which platforms are available.'}
+                >
                     <SegmentedControl
                         multi
-                        options={[
-                            { value: 'tiktok', label: 'tiktok' },
-                            { value: 'instagram', label: 'instagram' },
-                            { value: 'youtube', label: 'youtube' },
-                        ]}
+                        options={['tiktok', 'instagram', 'youtube'].map((value) => ({
+                            value,
+                            label: value,
+                            // Disabled rather than hidden: the operator should see
+                            // WHY a platform is unavailable, not wonder where it went.
+                            disabled: !!connected && !connected.includes(value),
+                            hint: connected && !connected.includes(value)
+                                ? 'not connected' : undefined,
+                        }))}
                         value={draft.publishing.platforms}
                         onChange={(v) => set('publishing.platforms',
-                            v.length ? v : ['tiktok'])}
+                            v.length ? v : draft.publishing.platforms)}
                     />
                 </Field>
+
+                {unavailable.length > 0 && (
+                    <div className="mb-4 p-3 bg-warn/10 rounded-input flex items-start gap-2">
+                        <AlertTriangle size={14} className="text-warn mt-0.5 shrink-0" />
+                        <p className="text-xs text-warn">
+                            {unavailable.join(', ')} {unavailable.length === 1 ? 'is' : 'are'} selected
+                            for publishing, but the profile
+                            “{draft.publishing.upload_post_user}” has no such account connected.
+                            Autopilot will refuse to start until this is resolved.
+                        </p>
+                    </div>
+                )}
 
                 <div className="grid sm:grid-cols-3 gap-x-4">
                     <Field label="clips per source">

@@ -81,23 +81,86 @@ def assert_transition(current: str, target: str) -> None:
 
 class ClipState:
     PENDING = "PENDING"        # generated, not yet given a slot
-    SCHEDULED = "SCHEDULED"    # a publish attempt owns it
-    PUBLISHED = "PUBLISHED"    # vendor accepted the submission
+    SCHEDULED = "SCHEDULED"    # a publish attempt owns it; vendor may hold it
+    PUBLISHED = "PUBLISHED"    # vendor CONFIRMED it went live (not merely accepted)
+    PARTIAL = "PARTIAL"        # live on some platforms, failed on others
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"        # not selected (below the top-N cut, wrong duration…)
-    ALL = frozenset({PENDING, SCHEDULED, PUBLISHED, FAILED, SKIPPED})
+    ALL = frozenset({PENDING, SCHEDULED, PUBLISHED, PARTIAL, FAILED, SKIPPED})
+    # Nothing more will happen to the clip without an operator.
+    SETTLED = frozenset({PUBLISHED, PARTIAL, FAILED, SKIPPED})
 
 
 class PublishState:
+    """Lifecycle of one publish attempt.
+
+    The distinction that matters: **SUBMITTED is not PUBLISHED**. Upload-Post
+    returning 2xx means it accepted the job. For a post scheduled three days out
+    nothing exists on any platform yet, and for an async upload the platforms
+    are still being worked through. Only a vendor status check saying so moves
+    an attempt to PUBLISHED.
+    """
     PENDING = "PENDING"        # row reserved, request not sent
     IN_FLIGHT = "IN_FLIGHT"    # request handed to the vendor, outcome unknown
-    SUBMITTED = "SUBMITTED"    # vendor accepted (scheduled or posted)
-    FAILED = "FAILED"          # vendor rejected; retryable within max_publish_attempts
-    UNCERTAIN = "UNCERTAIN"    # crashed mid-request — never auto-retried, needs a human
+    SUBMITTED = "SUBMITTED"    # vendor accepted; scheduled or queued, NOT live
+    PUBLISHING = "PUBLISHING"  # vendor is actively working the platforms
+    PUBLISHED = "PUBLISHED"    # vendor confirmed every platform succeeded
+    PARTIAL_FAILED = "PARTIAL_FAILED"  # some platforms live, others failed
+    FAILED = "FAILED"          # vendor rejected / every platform failed
+    UNCERTAIN = "UNCERTAIN"    # outcome unknown — never auto-retried
     CANCELED = "CANCELED"
-    ALL = frozenset({PENDING, IN_FLIGHT, SUBMITTED, FAILED, UNCERTAIN, CANCELED})
+    ALL = frozenset({PENDING, IN_FLIGHT, SUBMITTED, PUBLISHING, PUBLISHED,
+                     PARTIAL_FAILED, FAILED, UNCERTAIN, CANCELED})
     # States that still reserve a publishing slot / keep the clip file alive.
-    HOLDS_SLOT = frozenset({PENDING, IN_FLIGHT, SUBMITTED, UNCERTAIN})
+    # PUBLISHING and PARTIAL_FAILED are included: the vendor may still be
+    # working, and the operator needs the evidence to resolve a partial.
+    HOLDS_SLOT = frozenset({PENDING, IN_FLIGHT, SUBMITTED, PUBLISHING,
+                            PUBLISHED, PARTIAL_FAILED, UNCERTAIN})
+    # Nothing further will happen without an operator.
+    TERMINAL = frozenset({PUBLISHED, FAILED, CANCELED})
+    # Worth asking the vendor about on the next tick.
+    NEEDS_RECONCILIATION = frozenset({SUBMITTED, PUBLISHING, UNCERTAIN})
+
+
+# Legal publish transitions. Anything else is a bug rather than a state.
+PUBLISH_TRANSITIONS = {
+    PublishState.PENDING: frozenset({PublishState.IN_FLIGHT, PublishState.CANCELED,
+                                     PublishState.FAILED}),
+    PublishState.IN_FLIGHT: frozenset({PublishState.SUBMITTED, PublishState.PUBLISHING,
+                                       PublishState.PUBLISHED, PublishState.FAILED,
+                                       PublishState.PARTIAL_FAILED,
+                                       PublishState.UNCERTAIN, PublishState.PENDING}),
+    PublishState.SUBMITTED: frozenset({PublishState.PUBLISHING, PublishState.PUBLISHED,
+                                       PublishState.FAILED, PublishState.PARTIAL_FAILED,
+                                       PublishState.CANCELED, PublishState.UNCERTAIN}),
+    PublishState.PUBLISHING: frozenset({PublishState.PUBLISHED, PublishState.FAILED,
+                                        PublishState.PARTIAL_FAILED,
+                                        PublishState.UNCERTAIN}),
+    # An uncertain attempt is resolved by a status lookup or by a human, in
+    # either direction — including back to PENDING once we know it never landed.
+    PublishState.UNCERTAIN: frozenset({PublishState.SUBMITTED, PublishState.PUBLISHING,
+                                       PublishState.PUBLISHED, PublishState.FAILED,
+                                       PublishState.PARTIAL_FAILED, PublishState.PENDING,
+                                       PublishState.CANCELED}),
+    # A partial failure needs a human: they may accept it (PUBLISHED) or give up.
+    PublishState.PARTIAL_FAILED: frozenset({PublishState.PUBLISHED, PublishState.FAILED,
+                                            PublishState.CANCELED}),
+    PublishState.FAILED: frozenset({PublishState.PENDING, PublishState.CANCELED}),
+    PublishState.PUBLISHED: frozenset(),
+    PublishState.CANCELED: frozenset(),
+}
+
+
+def assert_publish_transition(current: str, target: str) -> None:
+    if current == target:
+        return
+    if target not in PublishState.ALL:
+        raise TransitionError(f"Unknown publish state {target!r}")
+    allowed = PUBLISH_TRANSITIONS.get(current)
+    if allowed is None:
+        raise TransitionError(f"Unknown publish state {current!r}")
+    if target not in allowed:
+        raise TransitionError(f"Illegal publish transition {current} → {target}")
 
 
 class RunStatus:
@@ -229,3 +292,21 @@ class PublishAttempt:
     created_at: Optional[str] = None
     title: str = ""
     description: str = ""
+    # --- vendor reconciliation (schema v2) ---
+    vendor_request_id: Optional[str] = None   # ours, sent with the request
+    vendor_job_id: Optional[str] = None       # theirs, for scheduled posts
+    vendor_status: Optional[str] = None       # last top-level status seen
+    vendor_results: Optional[List[Dict[str, Any]]] = None  # per-platform outcomes
+    last_status_check_at: Optional[str] = None
+    next_status_check_at: Optional[str] = None
+    finalized_at: Optional[str] = None
+
+    @property
+    def tracking_id(self) -> Optional[str]:
+        """Whichever identifier the vendor status endpoint accepts for this attempt."""
+        return self.vendor_job_id or self.vendor_request_id
+
+    @property
+    def is_vendor_scheduled(self) -> bool:
+        """True once Upload-Post holds this as a future scheduled job."""
+        return bool(self.vendor_job_id)

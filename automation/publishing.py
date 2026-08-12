@@ -27,6 +27,22 @@ from .models import (
 # in flight — it would either post immediately or reject the date.
 MIN_LEAD = timedelta(minutes=5)
 
+# How long after a scheduled slot to first ask the vendor what happened. The
+# vendor needs a moment to actually run the job; asking at the exact second
+# just returns "pending".
+SETTLE_DELAY_SECONDS = 120
+
+
+def vendor_request_id(attempt: PublishAttempt) -> str:
+    """Our own tracking id for the vendor, derived from the attempt row.
+
+    Deliberately distinct from :func:`idempotency_key`, which is Klippo's
+    internal "this clip may be published once" constraint. This one is the
+    vendor's handle for the same attempt, and the two must not be conflated:
+    the internal key guards our database, this one asks Upload-Post a question.
+    """
+    return f"klippo-{attempt.id}-{attempt.idempotency_key[:16]}"
+
 
 def idempotency_key(job_id: str, clip_index: int, platforms: List[str]) -> str:
     """Stable identity for "this clip, on these platforms".
@@ -196,10 +212,15 @@ def reslot_if_missed(db: AutopilotDB, attempt: PublishAttempt, config: Dict[str,
 
 async def dispatch_attempt(db: AutopilotDB, attempt: PublishAttempt, config: Dict[str, Any],
                            *, publisher, clip_path_resolver, now: datetime) -> bool:
-    """Send one reserved attempt to Upload-Post. Returns True on success.
+    """Send one reserved attempt to Upload-Post.
 
-    The row moves to IN_FLIGHT *before* the request leaves, so a crash mid-upload
-    is recoverable as "unknown outcome" instead of looking like it never started.
+    Returns True when the vendor ACCEPTED the job — which is not the same as
+    published. The attempt lands in SUBMITTED and only a later status check can
+    move it to PUBLISHED.
+
+    Ordering matters: our ``request_id`` is persisted and the row moves to
+    IN_FLIGHT *before* the request leaves. A crash mid-upload is then both
+    detectable (IN_FLIGHT) and resolvable (we know what to ask the vendor about).
     """
     from publishing_service import PublishError, PublishUncertain
 
@@ -227,17 +248,23 @@ async def dispatch_attempt(db: AutopilotDB, attempt: PublishAttempt, config: Dic
     if not api_key or not profile:
         db.log_event("publishing",
                      "Upload-Post credentials are not configured server-side — "
-                     "set UPLOAD_POST_API_KEY and UPLOAD_POST_USER",
+                     "set UPLOAD_POST_API_KEY and choose a profile",
                      level="error", source_id=attempt.source_id, job_id=attempt.job_id,
                      publish_attempt_id=attempt.id)
         db.set_publish_state(attempt.id, PublishState.PENDING,
                              error="Upload-Post credentials missing")
         return False
 
-    db.set_publish_state(attempt.id, PublishState.IN_FLIGHT)
+    # Stable, deterministic, and written down BEFORE the network call — that is
+    # what turns "did it post?" into a question the vendor can answer.
+    request_id = attempt.vendor_request_id or vendor_request_id(attempt)
+    db.record_vendor_ids(attempt.id, request_id=request_id, job_id=None)
+    db.set_publish_state(attempt.id, PublishState.IN_FLIGHT,
+                         expected=[PublishState.PENDING])
+
     scheduled_local = slot.astimezone(scheduler.get_zone(attempt.timezone or "UTC"))
     try:
-        response = await publisher.publish(
+        result = await publisher.publish(
             file_path=path,
             platforms=attempt.platforms,
             user=profile,
@@ -247,16 +274,22 @@ async def dispatch_attempt(db: AutopilotDB, attempt: PublishAttempt, config: Dic
             # Upload-Post reads a naive local datetime plus the timezone name.
             scheduled_date=scheduled_local.replace(tzinfo=None, microsecond=0).isoformat(),
             timezone=attempt.timezone or "UTC",
+            request_id=request_id,
         )
     except PublishUncertain as exc:
-        # Never auto-retried: the vendor has no idempotency key, so a retry here
-        # could publish the same clip twice. A human resolves it from the UI.
-        db.set_publish_state(attempt.id, PublishState.UNCERTAIN, error=str(exc))
+        # Never auto-retried: a blind re-POST could publish the same clip twice.
+        # It is not a dead end though — we hold the request_id, so the next tick
+        # asks the vendor what happened (see reconcile_attempt).
+        db.set_publish_state(
+            attempt.id, PublishState.UNCERTAIN, error=str(exc),
+            vendor_request_id=request_id,
+            next_status_check_at=iso(now + timedelta(seconds=30)))
         db.log_event("publishing",
-                     "Upload-Post gave no verdict — left UNCERTAIN, not retried "
-                     "(retrying could double-post)",
-                     level="error", source_id=attempt.source_id, job_id=attempt.job_id,
-                     publish_attempt_id=attempt.id)
+                     "Upload-Post gave no verdict — marked UNCERTAIN. Not retried "
+                     "(that could double-post); the outcome will be looked up instead.",
+                     level="warn", source_id=attempt.source_id, job_id=attempt.job_id,
+                     publish_attempt_id=attempt.id,
+                     data={"request_id": request_id})
         return False
     except PublishError as exc:
         limit = int((config.get("limits") or {}).get("max_publish_attempts", 3))
@@ -267,39 +300,196 @@ async def dispatch_attempt(db: AutopilotDB, attempt: PublishAttempt, config: Dic
                              increment_retry=True, error=str(exc))
         if terminal:
             db.set_clip_state(attempt.clip_id, ClipState.FAILED, "publish_failed")
-        db.log_event("publishing", f"Publish failed: {exc}",
+        db.log_event("publishing", f"Publish rejected: {exc}",
                      level="error" if terminal else "warn",
                      source_id=attempt.source_id, job_id=attempt.job_id,
                      publish_attempt_id=attempt.id,
                      data={"retry_count": retries, "terminal": terminal})
         return False
 
-    db.set_publish_state(attempt.id, PublishState.SUBMITTED, vendor_response=response)
-    db.set_clip_state(attempt.clip_id, ClipState.PUBLISHED)
+    # Accepted. The clip stays SCHEDULED — the vendor is holding it, nothing is
+    # live yet, and claiming otherwise is the bug this whole pass exists to fix.
+    db.set_publish_state(
+        attempt.id, PublishState.SUBMITTED,
+        vendor_response=_sanitize(result.get("response") if isinstance(result, dict) else None),
+        vendor_request_id=result.get("request_id") if isinstance(result, dict) else None,
+        vendor_job_id=result.get("job_id") if isinstance(result, dict) else None,
+        next_status_check_at=iso(_first_check_time(slot, now)),
+        expected=[PublishState.IN_FLIGHT])
+    db.set_clip_state(attempt.clip_id, ClipState.SCHEDULED)
     db.log_event("publishing",
-                 f"Submitted clip {attempt.clip_index + 1} for "
-                 f"{scheduler.describe_local(slot, config)}",
+                 f"Upload-Post accepted clip {attempt.clip_index + 1} for "
+                 f"{scheduler.describe_local(slot, config)} — not published yet",
                  source_id=attempt.source_id, job_id=attempt.job_id,
                  publish_attempt_id=attempt.id,
-                 data={"platforms": attempt.platforms, "slot_utc": iso(slot)})
+                 data={"platforms": attempt.platforms, "slot_utc": iso(slot),
+                       "job_id": (result or {}).get("job_id"),
+                       "request_id": (result or {}).get("request_id")})
     return True
 
 
-def reconcile_in_flight(db: AutopilotDB) -> int:
+def _sanitize(payload):
+    from publishing_service import sanitize_vendor_payload
+    return sanitize_vendor_payload(payload) if payload else None
+
+
+def _first_check_time(slot: Optional[datetime], now: datetime) -> datetime:
+    """When to first ask the vendor about a freshly accepted job.
+
+    A post scheduled for Thursday should not be polled every ten seconds until
+    Thursday — the vendor's cadence guidance is about an upload in progress, not
+    a calendar entry. So we wait until just after the slot, and poll an
+    immediate (unscheduled) upload promptly.
+    """
+    if slot is None or slot <= now:
+        return now + timedelta(seconds=SETTLE_DELAY_SECONDS)
+    return slot + timedelta(seconds=SETTLE_DELAY_SECONDS)
+
+
+async def reconcile_attempt(db: AutopilotDB, attempt: PublishAttempt, *,
+                            api_key: str, now: datetime) -> Optional[str]:
+    """Ask Upload-Post what actually happened to one attempt.
+
+    This is the only path to PUBLISHED. Returns the new state, or None when
+    nothing changed.
+    """
+    from publishing_service import PublishError, get_status, poll_interval_seconds
+
+    tracking_id = attempt.vendor_job_id or attempt.vendor_request_id
+    if not tracking_id:
+        return None
+
+    try:
+        status = await get_status(api_key,
+                                  request_id=attempt.vendor_request_id,
+                                  job_id=attempt.vendor_job_id)
+    except PublishError as exc:
+        # A status check failing tells us nothing about the post. Back off and
+        # try later rather than inventing an outcome.
+        db.set_publish_state(attempt.id, attempt.state, mark_checked=True,
+                             next_status_check_at=iso(now + timedelta(minutes=10)))
+        db.log_event("publishing", f"Status check failed: {exc}", level="warn",
+                     source_id=attempt.source_id, publish_attempt_id=attempt.id)
+        return None
+
+    results = [{"platform": r.platform, "status": r.status, "success": r.success,
+                "message": r.message, "timestamp": r.timestamp} for r in status.results]
+
+    # --- not found -----------------------------------------------------------
+    if status.not_found:
+        if attempt.state == PublishState.UNCERTAIN:
+            # The ambiguous request never reached the vendor: nothing was posted,
+            # so it is safe to send it again.
+            db.set_publish_state(
+                attempt.id, PublishState.PENDING,
+                error="Upload-Post has no record of this request — safe to resend",
+                vendor_status=status.status, mark_checked=True, next_status_check_at=None)
+            db.log_event("publishing",
+                         "Uncertain attempt resolved: the vendor never received it, "
+                         "so it has been re-queued",
+                         source_id=attempt.source_id, publish_attempt_id=attempt.id)
+            return PublishState.PENDING
+        # A previously-accepted job that the vendor no longer knows about is not
+        # something we can guess at.
+        db.set_publish_state(attempt.id, PublishState.UNCERTAIN,
+                             error="Upload-Post no longer has this job",
+                             vendor_status=status.status, mark_checked=True,
+                             next_status_check_at=None)
+        return PublishState.UNCERTAIN
+
+    # An UNCERTAIN attempt the vendor DOES know about was received after all.
+    base_state = attempt.state
+    if base_state == PublishState.UNCERTAIN:
+        db.log_event("publishing",
+                     f"Uncertain attempt resolved: Upload-Post has it ({status.status})",
+                     source_id=attempt.source_id, publish_attempt_id=attempt.id)
+
+    # --- mixed outcome -------------------------------------------------------
+    # Checked before the terminal statuses: `completed` means all succeeded and
+    # `failed` means all failed, so a mix can only be read off the results.
+    if status.is_partial_failure:
+        db.set_publish_state(
+            attempt.id, PublishState.PARTIAL_FAILED,
+            vendor_status=status.status, vendor_results=results,
+            vendor_response=status.raw, mark_checked=True, next_status_check_at=None,
+            error=(f"Published to {', '.join(status.succeeded_platforms)}; "
+                   f"failed on {', '.join(status.failed_platforms)}"))
+        db.set_clip_state(attempt.clip_id, ClipState.PARTIAL, "partial_platform_failure")
+        db.log_event("publishing",
+                     f"Partial publish — live on {', '.join(status.succeeded_platforms)}, "
+                     f"failed on {', '.join(status.failed_platforms)}. Not retried: "
+                     f"resending would duplicate the successful platforms.",
+                     level="error", source_id=attempt.source_id,
+                     publish_attempt_id=attempt.id, data={"results": results})
+        return PublishState.PARTIAL_FAILED
+
+    # --- terminal ------------------------------------------------------------
+    if status.status == "completed":
+        db.set_publish_state(attempt.id, PublishState.PUBLISHED,
+                             vendor_status=status.status, vendor_results=results,
+                             vendor_response=status.raw, mark_checked=True,
+                             next_status_check_at=None)
+        db.set_clip_state(attempt.clip_id, ClipState.PUBLISHED)
+        db.log_event("publishing",
+                     f"Published to {', '.join(status.succeeded_platforms) or 'all platforms'}",
+                     source_id=attempt.source_id, publish_attempt_id=attempt.id,
+                     data={"results": results})
+        return PublishState.PUBLISHED
+
+    if status.status == "failed":
+        db.set_publish_state(attempt.id, PublishState.FAILED,
+                             vendor_status=status.status, vendor_results=results,
+                             vendor_response=status.raw, mark_checked=True,
+                             next_status_check_at=None,
+                             error=status.message or "Upload-Post reported failure")
+        db.set_clip_state(attempt.clip_id, ClipState.FAILED, "vendor_failed")
+        db.log_event("publishing", f"Upload-Post reported failure: {status.message}",
+                     level="error", source_id=attempt.source_id,
+                     publish_attempt_id=attempt.id, data={"results": results})
+        return PublishState.FAILED
+
+    # --- still working -------------------------------------------------------
+    interval = poll_interval_seconds(status.status) or 60
+    target = (PublishState.PUBLISHING
+              if status.status in ("processing", "in_progress")
+              else PublishState.SUBMITTED)
+    # A scheduled job that has not executed yet stays 'pending' at the vendor;
+    # there is nothing to watch closely until its slot arrives.
+    if status.status == "pending" and attempt.scheduled_for_utc:
+        slot = parse_iso(attempt.scheduled_for_utc)
+        if slot and slot > now:
+            interval = max(interval, int((slot - now).total_seconds()) + SETTLE_DELAY_SECONDS)
+        target = PublishState.SUBMITTED
+
+    changed = target != base_state
+    db.set_publish_state(attempt.id, target, vendor_status=status.status,
+                         vendor_results=results or None, mark_checked=True,
+                         next_status_check_at=iso(now + timedelta(seconds=interval)))
+    if changed and target == PublishState.PUBLISHING:
+        db.log_event("publishing", "Upload-Post is publishing this clip now",
+                     source_id=attempt.source_id, publish_attempt_id=attempt.id)
+    return target if changed else None
+
+
+def reconcile_in_flight(db: AutopilotDB, *, now: Optional[datetime] = None) -> int:
     """Startup sweep: an IN_FLIGHT row means we died mid-request.
 
-    We cannot know whether the vendor accepted it. Marking it UNCERTAIN (and
-    never retrying automatically) is the only honest option — the alternative
-    silently double-posts.
+    We cannot know whether the vendor accepted it, so it becomes UNCERTAIN — but
+    it is scheduled for a status check rather than left for a human, because we
+    persisted our request_id before sending and can simply ask.
     """
+    now = now or utcnow()
     stuck = db.list_publish_attempts(states=[PublishState.IN_FLIGHT], limit=200)
     for attempt in stuck:
         db.set_publish_state(
             attempt.id, PublishState.UNCERTAIN,
-            error="Backend restarted while the upload was in flight; outcome unknown")
+            error="Backend restarted while the upload was in flight; outcome unknown",
+            next_status_check_at=iso(now))
         db.log_event("recovery",
-                     "Publish attempt was in flight during a restart — marked UNCERTAIN "
-                     "for manual review",
+                     "Publish attempt was in flight during a restart — marked UNCERTAIN. "
+                     + ("Its outcome will be looked up at the vendor."
+                        if attempt.vendor_request_id else
+                        "No request id was recorded, so it needs manual review."),
                      level="warn", source_id=attempt.source_id, job_id=attempt.job_id,
                      publish_attempt_id=attempt.id)
     return len(stuck)

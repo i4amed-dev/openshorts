@@ -11,9 +11,10 @@ several times slower), container RAM, free disk, the binaries the pipeline
 shells out to, whether the heavy models load at all, and whether each external
 service is reachable and configured.
 
-It never publishes anything. The Upload-Post check reads the profile list; it
-does not post, because a health check that posts to a real TikTok account is not
-a health check.
+It never publishes anything and never cancels anything. The Upload-Post checks
+read the profile list and query the status endpoint with a deliberately
+nonexistent id — a health check that posts to a real TikTok account is not a
+health check.
 """
 from __future__ import annotations
 
@@ -228,8 +229,13 @@ def check_youtube_api(report):
 
 
 def check_upload_post(report):
+    """Validate the unattended publishing setup WITHOUT publishing anything.
+
+    Reads the profile list and, if configured, checks that the exact platforms
+    Autopilot will publish to are actually connected — the failure that
+    otherwise surfaces as a scheduled post silently failing at 21:00.
+    """
     key = os.environ.get("UPLOAD_POST_API_KEY")
-    user = os.environ.get("UPLOAD_POST_USER")
     if not key:
         return report.add("upload-post", FAIL, "UPLOAD_POST_API_KEY is not set")
 
@@ -243,21 +249,97 @@ def check_upload_post(report):
         return report.add("upload-post", FAIL, str(exc)[:140])
 
     names = [p["username"] for p in found]
-    if not user:
+
+    # Profile precedence: Autopilot's own setting first, env as the fallback.
+    profile = None
+    try:
+        from automation.service import get_service
+        profile = ((get_service().get_settings().get("publishing") or {})
+                   .get("upload_post_user"))
+    except Exception:
+        pass
+    profile = profile or os.environ.get("UPLOAD_POST_USER")
+
+    if not profile:
         return report.add("upload-post", FAIL,
-                          f"UPLOAD_POST_USER is not set. Profiles on this key: "
+                          f"No Upload-Post profile selected. Available: "
                           f"{', '.join(names) or 'none'}")
-    if user not in names:
+    if profile not in names:
         return report.add("upload-post", FAIL,
-                          f"UPLOAD_POST_USER={user!r} is not on this account. "
+                          f"Profile {profile!r} is not on this account. "
                           f"Available: {', '.join(names) or 'none'}")
-    connected = next((p["connected"] for p in found if p["username"] == user), [])
+
+    connected = next((p["connected"] for p in found if p["username"] == profile), [])
     if not connected:
         return report.add("upload-post", WARN,
-                          f"profile {user!r} exists but has no social account linked yet")
+                          f"profile {profile!r} exists but has no social account linked")
+
+    wanted = []
+    try:
+        from automation.service import get_service
+        wanted = list((get_service().get_settings().get("publishing") or {})
+                      .get("platforms") or [])
+    except Exception:
+        pass
+    missing = [p for p in wanted if p not in connected]
+    if missing:
+        return report.add("upload-post", FAIL,
+                          f"Autopilot is set to publish to {', '.join(missing)}, but "
+                          f"profile {profile!r} only has {', '.join(connected)} connected")
+
     # Nothing is posted here — only the profile list is read.
     return report.add("upload-post", OK,
-                      f"profile {user!r} linked to: {', '.join(connected)}")
+                      f"profile {profile!r} linked to: {', '.join(connected)}"
+                      + (f" (publishing to {', '.join(wanted)})" if wanted else ""))
+
+
+def check_upload_post_status_api(report):
+    """The reconciliation path must work, or nothing ever reaches PUBLISHED.
+
+    Uses a harmless read: a made-up id is expected to answer ``not_found``,
+    which proves the endpoint and the key work without touching real content.
+    """
+    key = os.environ.get("UPLOAD_POST_API_KEY")
+    if not key:
+        return report.add("upload-post status api", SKIP, "no API key configured")
+
+    async def probe():
+        import publishing_service
+        return await publishing_service.get_status(
+            key, request_id="klippo-healthcheck-probe-does-not-exist")
+
+    try:
+        status = asyncio.run(probe())
+    except Exception as exc:
+        return report.add("upload-post status api", FAIL,
+                          f"status endpoint unreachable — publishes could never be "
+                          f"confirmed: {str(exc)[:100]}")
+    if status.not_found:
+        return report.add("upload-post status api", OK,
+                          "reachable (probe id correctly reported as not_found)")
+    return report.add("upload-post status api", WARN,
+                      f"reachable but answered {status.status!r} for a nonexistent id")
+
+
+def check_quota_model(report):
+    """The two YouTube allocations are tracked separately and look sane."""
+    try:
+        from automation.db import AutopilotDB
+        from automation.youtube_client import (
+            BUCKET_GENERAL, BUCKET_SEARCH, DEFAULT_GENERAL_UNITS, DEFAULT_SEARCH_CALLS,
+        )
+        db = AutopilotDB().connect()
+        general = db.get_quota("youtube", BUCKET_GENERAL)
+        search = db.get_quota("youtube", BUCKET_SEARCH)
+        db.close()
+    except Exception as exc:
+        return report.add("youtube quota model", FAIL, str(exc)[:140])
+
+    return report.add(
+        "youtube quota model", OK,
+        f"general {general['units_used']}/{DEFAULT_GENERAL_UNITS} units · "
+        f"search {search['units_used']}/{DEFAULT_SEARCH_CALLS} calls "
+        f"(independent allocations)")
 
 
 def main() -> int:
@@ -288,13 +370,17 @@ def main() -> int:
     check_autopilot_db(report)
     check_autopilot_config(report)
 
+    check_quota_model(report)
+
     if args.skip_network:
-        for name in ("gemini", "youtube data api", "upload-post"):
+        for name in ("gemini", "youtube data api", "upload-post",
+                     "upload-post status api"):
             report.add(name, SKIP, "skipped (--skip-network)")
     else:
         check_gemini(report)
         check_youtube_api(report)
         check_upload_post(report)
+        check_upload_post_status_api(report)
 
     if args.json:
         print(json.dumps({"ok": not report.failed, "checks": report.rows}, indent=2))

@@ -50,9 +50,17 @@ class ClipGeneratorPort:
 
 @dataclass
 class PublisherPort:
-    """Adapter over the shared Upload-Post publishing service."""
+    """Adapter over the shared Upload-Post publishing service.
+
+    Every vendor call Autopilot makes goes through here, so ``publishing_service``
+    stays the only module that speaks HTTP to Upload-Post. ``publish`` returns
+    ``{response, request_id, job_id}`` — the identifiers matter because a 2xx
+    only means the job was accepted, and reconciliation needs something to ask
+    about later.
+    """
     publish: Callable[..., Awaitable[Dict[str, Any]]]
     credentials: Callable[[], tuple]   # -> (api_key or None, profile or None)
+    list_profiles: Optional[Callable[..., Awaitable[List[Dict[str, Any]]]]] = None
 
 
 @dataclass

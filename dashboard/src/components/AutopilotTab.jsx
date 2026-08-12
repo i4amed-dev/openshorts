@@ -27,6 +27,7 @@ const ACTIONS = {
     'retry-publish': (id) => [`/api/autopilot/publishes/${id}/retry`, {}],
     'force-retry-publish': (id) => [`/api/autopilot/publishes/${id}/force-retry`, {}],
     'resolve-publish': (id) => [`/api/autopilot/publishes/${id}/resolve`, {}],
+    'abandon-publish': (id) => [`/api/autopilot/publishes/${id}/abandon`, {}],
 };
 
 export default function AutopilotTab() {
@@ -36,6 +37,7 @@ export default function AutopilotTab() {
     const [busy, setBusy] = useState(false);
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState('');
+    const [preflight, setPreflight] = useState(null);
     const [loadError, setLoadError] = useState('');
     const timer = useRef(null);
 
@@ -84,7 +86,16 @@ export default function AutopilotTab() {
                 const body = await res.text();
                 let detail = body;
                 try { detail = JSON.parse(body).detail || body; } catch { /* raw text */ }
-                setError(typeof detail === 'string' ? detail : 'That action was refused.');
+                if (detail && typeof detail === 'object' && Array.isArray(detail.errors)) {
+                    // Preflight refused the enable: list every unmet requirement
+                    // rather than a single opaque failure.
+                    setError(detail.errors.join(' '));
+                    setPreflight(detail);
+                } else {
+                    setError(typeof detail === 'string' ? detail : 'That action was refused.');
+                }
+            } else if (name === 'enable') {
+                setPreflight(null);
             }
         } catch (e) {
             setError(e.message || 'That action failed.');
@@ -148,7 +159,29 @@ export default function AutopilotTab() {
                 </div>
             )}
 
-            {error && view === 'ops' && (
+            {preflight?.checks && view === 'ops' && (
+                <div className="card p-4 mb-5 border-warn/40">
+                    <div className="flex items-center gap-2 mb-3">
+                        <AlertTriangle size={15} className="text-warn shrink-0" />
+                        <p className="text-sm text-warn">Autopilot cannot start yet</p>
+                        <button onClick={() => setPreflight(null)}
+                            className="readout ml-auto hover:text-ink">dismiss</button>
+                    </div>
+                    <div className="space-y-1.5">
+                        {preflight.checks.filter((c) => !c.ok).map((c) => (
+                            <p key={c.id} className="text-xs text-ink2 leading-relaxed">
+                                <span className="text-danger">✕</span> {c.message}
+                            </p>
+                        ))}
+                    </div>
+                    <button onClick={() => setView('setup')}
+                        className="btn-quiet px-3 py-1.5 text-xs mt-3">
+                        open setup
+                    </button>
+                </div>
+            )}
+
+            {error && !preflight && view === 'ops' && (
                 <div className="card p-3 mb-5 flex items-center gap-2 border-warn/40">
                     <AlertTriangle size={14} className="text-warn shrink-0" />
                     <p className="text-xs text-warn">{error}</p>

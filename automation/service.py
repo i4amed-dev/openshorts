@@ -30,6 +30,14 @@ TICK_SECONDS = int(os.environ.get("AUTOPILOT_TICK_SECONDS", "30"))
 LEASE_TTL_SECONDS = int(os.environ.get("AUTOPILOT_LEASE_TTL", "120"))
 
 
+class PreflightError(RuntimeError):
+    """Autopilot cannot be enabled yet. Carries the individual check results."""
+
+    def __init__(self, report: Dict[str, Any]):
+        super().__init__("; ".join(report.get("errors") or ["Preflight failed"]))
+        self.report = report
+
+
 class AutopilotService:
     """Owns the database handle, the loop task and the operator actions."""
 
@@ -129,12 +137,130 @@ class AutopilotService:
 
     # --- operator actions -----------------------------------------------------
 
-    def enable(self) -> Dict[str, Any]:
+    async def preflight(self, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Everything that must be true before unattended execution is allowed.
+
+        Saving settings stays permissive — you can configure Autopilot offline.
+        *Enabling* it is the commitment, so the checks happen here rather than
+        surfacing at 03:00 as a failed post nobody is awake to see.
+
+        Returns ``{ok, checks:[{id, ok, message}], errors:[…]}``. Never contains
+        a credential value.
+        """
+        config = config or self.get_settings()
+        checks: List[Dict[str, Any]] = []
+
+        def add(check_id: str, ok: bool, message: str) -> bool:
+            checks.append({"id": check_id, "ok": bool(ok), "message": message})
+            return ok
+
+        add("gemini_key", bool(os.environ.get("GEMINI_API_KEY")),
+            "GEMINI_API_KEY must be set in the server environment — unattended "
+            "runs cannot read the browser's stored keys.")
+        add("youtube_key", bool(os.environ.get("YOUTUBE_DATA_API_KEY")),
+            "YOUTUBE_DATA_API_KEY must be set for source discovery.")
+
+        publisher = self.orchestrator.runtime.publisher
+        api_key = profile = None
+        if publisher is not None:
+            try:
+                api_key, profile = publisher.credentials()
+            except Exception:
+                pass
+        add("upload_post_key", bool(api_key),
+            "UPLOAD_POST_API_KEY must be set in the server environment.")
+        add("upload_post_profile", bool(profile),
+            "Choose an Upload-Post profile to publish as (Autopilot setup → publishing).")
+
+        wanted = list((config.get("publishing") or {}).get("platforms") or [])
+
+        # The check that actually saves a scheduled post from failing silently:
+        # the chosen profile must have every selected platform connected.
+        if api_key and profile and publisher is not None and publisher.list_profiles:
+            try:
+                profiles = await publisher.list_profiles()
+            except Exception as exc:
+                add("profile_reachable", False,
+                    f"Could not reach Upload-Post to verify the profile: {exc}")
+                profiles = None
+            else:
+                add("profile_reachable", True, "Upload-Post is reachable.")
+                names = [p.get("username") for p in profiles]
+                if profile not in names:
+                    add("profile_exists", False,
+                        f"Upload-Post has no profile named '{profile}'. "
+                        f"Available: {', '.join(n for n in names if n) or 'none'}.")
+                else:
+                    add("profile_exists", True, f"Profile '{profile}' exists.")
+                    connected = next((p.get("connected") or [] for p in profiles
+                                      if p.get("username") == profile), [])
+                    missing = [p for p in wanted if p not in connected]
+                    add("platforms_connected", not missing,
+                        (f"{', '.join(missing)} selected for publishing, but the "
+                         f"Upload-Post profile '{profile}' only has "
+                         f"{', '.join(connected) or 'no account'} connected.")
+                        if missing else
+                        f"'{profile}' has {', '.join(connected)} connected.")
+
+        rights = config.get("rights") or {}
+        policy_ok = bool(rights.get("policy"))
+        if rights.get("policy") in ("OWNED_OR_ALLOWLISTED_CHANNELS",
+                                    "CREATIVE_COMMONS_OR_ALLOWLISTED"):
+            policy_ok = bool(rights.get("allowlisted_channel_ids"))
+        add("rights_policy", policy_ok,
+            "The selected rights policy needs at least one approved channel id."
+            if not policy_ok else f"Rights policy: {rights.get('policy')}.")
+
+        schedule = config.get("schedule") or {}
+        add("publish_schedule", bool(schedule.get("publish_times")),
+            "At least one publishing slot is required.")
+        add("discovery_schedule", bool(schedule.get("discovery_times")),
+            "At least one discovery time is required.")
+
+        if "niche_search" in ((config.get("discovery") or {}).get("strategies") or []):
+            add("search_topics", bool((config.get("discovery") or {}).get("topics")),
+                "Niche search is enabled but no topics are configured.")
+
+        try:
+            self.db.log_event("settings", "Preflight check", level="debug")
+            add("database", True, f"Database is writable at {self.db.path}.")
+        except Exception as exc:
+            add("database", False, f"Autopilot database is not writable: {exc}")
+
+        add("runtime", self.orchestrator.runtime.ready,
+            "The backend has not registered its Clip Generator / publishing "
+            "adapters — restart the backend.")
+
+        errors = [c["message"] for c in checks if not c["ok"]]
+        return {"ok": not errors, "checks": checks, "errors": errors}
+
+    async def enable(self) -> Dict[str, Any]:
+        """Turn Autopilot on, but only if it can actually run.
+
+        Raises PreflightError with the specific failures — enabling into a
+        configuration that cannot publish is how a week of silence happens.
+        """
+        config = self.get_settings()
+        result = await self.preflight(config)
+        if not result["ok"]:
+            raise PreflightError(result)
         config = self.update_settings({"enabled": True})
         self.db.update_engine_state(engine_status=EngineStatus.IDLE, pause_requested=0,
                                     paused_reason=None, consecutive_failures=0)
         self.db.log_event("engine", "Autopilot enabled")
         return config
+
+    async def list_upload_post_profiles(self) -> List[Dict[str, Any]]:
+        """Profiles on the server-side key — usernames and linked platforms only.
+
+        The API key never leaves the server: this returns exactly what the setup
+        UI needs to offer a profile picker and to grey out platforms the chosen
+        profile cannot post to.
+        """
+        publisher = self.orchestrator.runtime.publisher
+        if publisher is None or not publisher.list_profiles:
+            return []
+        return await publisher.list_profiles()
 
     def disable(self) -> Dict[str, Any]:
         config = self.update_settings({"enabled": False})
@@ -153,34 +279,121 @@ class AutopilotService:
                                     engine_status=EngineStatus.IDLE)
         self.db.log_event("engine", "Resumed")
 
-    def emergency_stop(self) -> Dict[str, int]:
-        """Kill switch: disable, and cancel everything not already handed to the vendor.
+    async def emergency_stop(self, *, now: Optional[datetime] = None) -> Dict[str, Any]:
+        """Kill switch: stop the engine and cancel every post we still can.
 
-        SUBMITTED attempts are left alone on purpose — the post already exists on
-        Upload-Post's calendar and only they can cancel it. Saying otherwise in
-        the UI would be a lie.
+        Ordering is deliberate. Disable first so no tick can create new work
+        while we are cancelling, then drop local PENDING attempts, then ask
+        Upload-Post to cancel the future scheduled jobs it is holding for us.
+
+        Only jobs Klippo submitted through Autopilot are touched: the vendor job
+        ids come from our own ``publish_attempt`` rows, so Manual Mode posts —
+        which Autopilot never records — cannot be cancelled by this.
+
+        A cancellation is marked CANCELED only when the vendor confirms it. A
+        404 means "unknown or already executed", which is NOT success, and the
+        attempt is left for reconciliation rather than reported as cancelled.
         """
         self.update_settings({"enabled": False})
-        canceled = 0
+        self.db.update_engine_state(engine_status=EngineStatus.OFF, pause_requested=1,
+                                    paused_reason="Emergency stop")
+
+        report = {"canceled_local": 0, "canceled_vendor": 0, "vendor_not_found": 0,
+                  "vendor_errors": 0, "released_sources": 0, "already_published": 0}
+
+        # 1. Local attempts that never left: safe to cancel outright.
         for attempt in self.db.list_publish_attempts(states=[PublishState.PENDING], limit=500):
-            self.db.set_publish_state(attempt.id, PublishState.CANCELED,
-                                      error="Emergency stop")
-            self.db.set_clip_state(attempt.clip_id, ClipState.SKIPPED, "emergency_stop")
-            canceled += 1
-        released = 0
+            if self.db.set_publish_state(attempt.id, PublishState.CANCELED,
+                                         error="Emergency stop",
+                                         expected=[PublishState.PENDING]):
+                self.db.set_clip_state(attempt.clip_id, ClipState.SKIPPED, "emergency_stop")
+                report["canceled_local"] += 1
+
+        # 2. Future scheduled jobs Upload-Post is holding for us.
+        publisher = self.orchestrator.runtime.publisher
+        api_key = None
+        if publisher is not None:
+            try:
+                api_key, _profile = publisher.credentials()
+            except Exception:
+                api_key = None
+
+        if api_key:
+            import publishing_service
+            now = now or utcnow()
+            for attempt in self.db.vendor_scheduled_attempts():
+                if not attempt.vendor_job_id:
+                    continue
+                slot = parse_iso(attempt.scheduled_for_utc)
+                if slot is not None and slot <= now:
+                    # Its moment has passed; it may already be live. Reconcile
+                    # rather than claim a cancellation we cannot make.
+                    report["already_published"] += 1
+                    self.db.set_publish_state(
+                        attempt.id, attempt.state, mark_checked=False,
+                        next_status_check_at=iso(now))
+                    continue
+                try:
+                    outcome, detail = await publishing_service.cancel_scheduled(
+                        api_key, attempt.vendor_job_id)
+                except Exception as exc:
+                    outcome, detail = publishing_service.CancelOutcome.ERROR, str(exc)
+
+                if outcome == publishing_service.CancelOutcome.CANCELED:
+                    self.db.set_publish_state(attempt.id, PublishState.CANCELED,
+                                              error="Emergency stop — cancelled at Upload-Post",
+                                              next_status_check_at=None)
+                    self.db.set_clip_state(attempt.clip_id, ClipState.SKIPPED, "emergency_stop")
+                    report["canceled_vendor"] += 1
+                    self.db.log_event("publishing",
+                                      f"Cancelled scheduled job {attempt.vendor_job_id}",
+                                      source_id=attempt.source_id,
+                                      publish_attempt_id=attempt.id)
+                elif outcome == publishing_service.CancelOutcome.NOT_FOUND:
+                    # Never reported as cancelled — it may have already run.
+                    report["vendor_not_found"] += 1
+                    self.db.set_publish_state(
+                        attempt.id, PublishState.UNCERTAIN,
+                        error=f"Emergency stop: {detail}",
+                        next_status_check_at=iso(now))
+                    self.db.log_event("publishing",
+                                      f"Could not cancel {attempt.vendor_job_id}: {detail}. "
+                                      f"Its real outcome will be looked up.",
+                                      level="warn", source_id=attempt.source_id,
+                                      publish_attempt_id=attempt.id)
+                else:
+                    report["vendor_errors"] += 1
+                    self.db.set_publish_state(
+                        attempt.id, attempt.state,
+                        error=f"Emergency stop could not cancel: {detail}",
+                        next_status_check_at=iso(now))
+                    self.db.log_event("publishing",
+                                      f"Cancellation failed for {attempt.vendor_job_id}: {detail}",
+                                      level="error", source_id=attempt.source_id,
+                                      publish_attempt_id=attempt.id)
+        elif self.db.vendor_scheduled_attempts():
+            self.db.log_event("engine",
+                              "Emergency stop could not reach Upload-Post (no API key) — "
+                              "scheduled posts remain on the vendor calendar",
+                              level="error")
+
+        # 3. Drop the candidate queue.
         for state in (SourceState.SELECTED, SourceState.ELIGIBLE):
             for source in self.db.list_sources(states=[state], limit=500):
                 if self.db.transition_source(source.id, SourceState.SKIPPED,
                                              expected=[state],
                                              rejection_reason="emergency_stop"):
-                    released += 1
-        self.db.update_engine_state(engine_status=EngineStatus.OFF, pause_requested=1,
-                                    paused_reason="Emergency stop")
-        self.db.log_event("engine",
-                          f"EMERGENCY STOP — {canceled} scheduled post(s) canceled, "
-                          f"{released} candidate(s) dropped. Already-submitted posts "
-                          f"remain on the Upload-Post calendar.", level="error")
-        return {"canceled_publishes": canceled, "released_sources": released}
+                    report["released_sources"] += 1
+
+        self.db.log_event(
+            "engine",
+            f"EMERGENCY STOP — {report['canceled_local']} queued post(s) dropped, "
+            f"{report['canceled_vendor']} cancelled at Upload-Post, "
+            f"{report['vendor_not_found']} could not be cancelled (unknown or already run), "
+            f"{report['vendor_errors']} error(s), "
+            f"{report['released_sources']} candidate(s) dropped.", level="error",
+            data=report)
+        return report
 
     async def run_discovery_now(self) -> Dict[str, Any]:
         config = self.get_settings()
@@ -234,7 +447,9 @@ class AutopilotService:
         attempt = self.db.get_publish_attempt(attempt_id)
         if attempt is None or attempt.state != PublishState.FAILED:
             return False
-        self.db.set_publish_state(attempt_id, PublishState.PENDING, error=None)
+        self.db.set_publish_state(attempt_id, PublishState.PENDING, error=None,
+                                  next_status_check_at=None,
+                                  expected=[PublishState.FAILED])
         self.db.set_clip_state(attempt.clip_id, ClipState.SCHEDULED)
         self.db.log_event("publishing", "Publish attempt re-queued by the operator",
                           publish_attempt_id=attempt_id, source_id=attempt.source_id)
@@ -244,7 +459,9 @@ class AutopilotService:
         attempt = self.db.get_publish_attempt(attempt_id)
         if attempt is None or attempt.state != PublishState.UNCERTAIN:
             return False
-        self.db.set_publish_state(attempt_id, PublishState.PENDING, error=None)
+        self.db.set_publish_state(attempt_id, PublishState.PENDING, error=None,
+                                  next_status_check_at=None,
+                                  expected=[PublishState.UNCERTAIN])
         self.db.log_event("publishing",
                           "Operator confirmed the uncertain post did NOT go out — re-queued",
                           level="warn", publish_attempt_id=attempt_id,
@@ -252,15 +469,47 @@ class AutopilotService:
         return True
 
     def resolve_uncertain(self, attempt_id: int) -> bool:
-        """Operator confirmed the post *did* land: close it out as submitted."""
+        """Operator verified an ambiguous or partial attempt on the vendor calendar.
+
+        Accepts both UNCERTAIN (we never learned the outcome) and PARTIAL_FAILED
+        (some platforms failed and the operator has decided to accept it as is).
+        Either way this is a human asserting a fact we could not establish, so
+        it is recorded as such rather than as a vendor confirmation.
+        """
         attempt = self.db.get_publish_attempt(attempt_id)
-        if attempt is None or attempt.state != PublishState.UNCERTAIN:
+        if attempt is None or attempt.state not in (PublishState.UNCERTAIN,
+                                                    PublishState.PARTIAL_FAILED):
             return False
-        self.db.set_publish_state(attempt_id, PublishState.SUBMITTED,
-                                  error="Confirmed by the operator after an unknown outcome")
+        self.db.set_publish_state(
+            attempt_id, PublishState.PUBLISHED,
+            error="Confirmed by the operator, not by an Upload-Post status check",
+            next_status_check_at=None,
+            expected=[PublishState.UNCERTAIN, PublishState.PARTIAL_FAILED])
         self.db.set_clip_state(attempt.clip_id, ClipState.PUBLISHED)
-        self.db.log_event("publishing", "Operator confirmed the post was published",
+        self.db.log_event("publishing", "Operator confirmed the post is live",
                           publish_attempt_id=attempt_id, source_id=attempt.source_id)
+        return True
+
+    def abandon_attempt(self, attempt_id: int) -> bool:
+        """Give up on a partial/uncertain attempt without publishing anything more.
+
+        The counterpart to :meth:`resolve_uncertain`: for a partial failure the
+        operator may prefer to leave the successful platforms alone and simply
+        stop. Klippo must never "fix" a partial by resending — that would
+        duplicate the platforms that already succeeded.
+        """
+        attempt = self.db.get_publish_attempt(attempt_id)
+        if attempt is None or attempt.state not in (PublishState.UNCERTAIN,
+                                                    PublishState.PARTIAL_FAILED):
+            return False
+        self.db.set_publish_state(
+            attempt_id, PublishState.FAILED, error="Abandoned by the operator",
+            next_status_check_at=None,
+            expected=[PublishState.UNCERTAIN, PublishState.PARTIAL_FAILED])
+        self.db.set_clip_state(attempt.clip_id, ClipState.FAILED, "abandoned_by_operator")
+        self.db.log_event("publishing", "Operator abandoned this attempt",
+                          level="warn", publish_attempt_id=attempt_id,
+                          source_id=attempt.source_id)
         return True
 
     # --- dashboard view -------------------------------------------------------
@@ -296,8 +545,13 @@ class AutopilotService:
         if future:
             next_publish = future[0].scheduled_for_utc
 
-        quota = self.db.get_quota("youtube")
-        blocked = parse_iso(quota.get("exhausted_until"))
+        from .youtube_client import (
+            BUCKET_GENERAL, BUCKET_SEARCH, DEFAULT_GENERAL_UNITS, DEFAULT_SEARCH_CALLS,
+        )
+        general = self.db.get_quota("youtube", BUCKET_GENERAL)
+        search = self.db.get_quota("youtube", BUCKET_SEARCH)
+        general_block = parse_iso(general.get("exhausted_until"))
+        search_block = parse_iso(search.get("exhausted_until"))
 
         lease = self.db.lease_holder() or {}
 
@@ -322,6 +576,7 @@ class AutopilotService:
                 "posts_scheduled": self.db.posts_scheduled_between(day_start, day_end),
                 "max_posts": (config.get("schedule") or {}).get("max_posts_per_day"),
                 "posts_submitted": self._submitted_since(day_start),
+                "posts_published": self._published_since(day_start),
             },
             "queue": [_source_view(s) for s in self.db.list_sources(
                 states=[SourceState.ELIGIBLE], limit=12)],
@@ -338,10 +593,17 @@ class AutopilotService:
             "recent_errors": self.db.recent_events(limit=15, level="error"),
             "events": self.db.recent_events(limit=40),
             "runs": self.db.recent_runs(limit=8),
+            # Two independent allocations since 1-jun-2026 — reported separately
+            # because exhausting one does not stop the other.
             "youtube_quota": {
-                "units_used_today": quota.get("units_used", 0),
-                "daily_budget": (config.get("limits") or {}).get("youtube_daily_quota_units"),
-                "blocked_until": iso(blocked) if blocked and blocked > now else None,
+                "general_units_used": general.get("units_used", 0),
+                "general_budget": (config.get("limits") or {}).get(
+                    "youtube_daily_quota_units", DEFAULT_GENERAL_UNITS),
+                "general_blocked_until": iso(general_block) if general_block and general_block > now else None,
+                "search_calls_used": search.get("units_used", 0),
+                "search_budget": (config.get("limits") or {}).get(
+                    "youtube_daily_search_calls", DEFAULT_SEARCH_CALLS),
+                "search_blocked_until": iso(search_block) if search_block and search_block > now else None,
                 "configured": bool(os.environ.get("YOUTUBE_DATA_API_KEY")),
             },
             "credentials": self._credential_state(config),
@@ -379,8 +641,16 @@ class AutopilotService:
         return int(row["n"]) if row else 0
 
     def _submitted_since(self, since: datetime) -> int:
+        """Accepted by the vendor — NOT necessarily live anywhere."""
         row = self.db.query_one(
             "SELECT COUNT(*) AS n FROM publish_attempt WHERE submitted_at >= ?", (iso(since),))
+        return int(row["n"]) if row else 0
+
+    def _published_since(self, since: datetime) -> int:
+        """Confirmed live by an Upload-Post status check."""
+        row = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM publish_attempt WHERE finalized_at >= ? "
+            "AND state = ?", (iso(since), PublishState.PUBLISHED))
         return int(row["n"]) if row else 0
 
     def _credential_state(self, config: Dict[str, Any]) -> Dict[str, Any]:
@@ -477,6 +747,15 @@ def _publish_view(attempt, config) -> Dict[str, Any]:
         "error": attempt.error,
         "submitted_at": attempt.submitted_at,
         "created_at": attempt.created_at,
+        # Vendor evidence. The identifier is truncated for display — it is not a
+        # secret, but the full value is noise in a list.
+        "vendor_status": attempt.vendor_status,
+        "vendor_tracking_id": (attempt.tracking_id or "")[:24] or None,
+        "vendor_is_scheduled": attempt.is_vendor_scheduled,
+        "vendor_results": attempt.vendor_results,
+        "last_status_check_at": attempt.last_status_check_at,
+        "next_status_check_at": attempt.next_status_check_at,
+        "finalized_at": attempt.finalized_at,
     }
 
 

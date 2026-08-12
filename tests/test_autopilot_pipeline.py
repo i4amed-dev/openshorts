@@ -9,6 +9,7 @@ The restart tests matter most: they rebuild the orchestrator from the database
 between stages, which is precisely what a `docker compose restart` does.
 """
 from datetime import datetime, timedelta, timezone
+from typing import List
 
 import pytest
 
@@ -18,8 +19,8 @@ from automation.orchestrator import Orchestrator
 from automation.ports import Runtime
 from automation.youtube_client import QuotaExhausted
 from autopilot_fakes import (
-    FakeClipGenerator, FakePublisher, FakeYouTubeClient, base_config, make_record,
-    run_async,
+    FakeClipGenerator, FakePublisher, FakeYouTubeClient, base_config, install_fake_vendor,
+    make_record, platform_result, run_async, status_payload,
 )
 
 NOW = datetime(2026, 8, 12, 8, 0, tzinfo=timezone.utc)
@@ -38,6 +39,7 @@ class Harness:
         self.runtime = Runtime(clip_generator=self.clip_gen.port(),
                                publisher=self.publisher.port())
         self.orchestrator = self._build()
+        _LIVE_PUBLISHERS.append(self.publisher)
 
     def _build(self):
         return Orchestrator(self.db, self.runtime, client_factory=lambda: self.youtube)
@@ -45,7 +47,7 @@ class Harness:
     def restart(self):
         """Simulate a backend restart: new orchestrator, same database."""
         self.orchestrator = self._build()
-        self.orchestrator.reconcile_on_start()
+        self.orchestrator.reconcile_on_start(now=NOW)
         return self.orchestrator
 
     def tick(self, now=NOW):
@@ -67,7 +69,48 @@ class Harness:
         return run_async(self.orchestrator.run_discovery(now=now, force=True))
 
     def close(self):
+        if self.publisher in _LIVE_PUBLISHERS:
+            _LIVE_PUBLISHERS.remove(self.publisher)
         self.db.close()
+
+
+# Harnesses register here so the autouse patch below can route vendor calls to
+# the right fake. Scoped through monkeypatch so the real functions are restored
+# after every test — a module-global patch leaked into the transport tests that
+# exercise the genuine HTTP paths.
+_LIVE_PUBLISHERS: List["FakePublisher"] = []
+
+
+@pytest.fixture(autouse=True)
+def _fake_vendor(monkeypatch):
+    import publishing_service
+
+    def _route(request_id=None, job_id=None):
+        key = job_id or request_id or ""
+        for publisher in reversed(_LIVE_PUBLISHERS):
+            if key in publisher.status_script or publisher.default_status is not None:
+                return publisher
+        return _LIVE_PUBLISHERS[-1] if _LIVE_PUBLISHERS else None
+
+    async def fake_get_status(api_key, *, request_id=None, job_id=None, timeout=30.0):
+        publisher = _route(request_id, job_id)
+        if publisher is None:
+            return publishing_service.parse_status({"status": "pending"})
+        payload = publisher.next_status(request_id=request_id, job_id=job_id)
+        http = 404 if payload.get("status") == "not_found" else 200
+        return publishing_service.parse_status(payload, http_status=http)
+
+    async def fake_cancel(api_key, job_id, *, timeout=30.0):
+        publisher = _LIVE_PUBLISHERS[-1] if _LIVE_PUBLISHERS else None
+        if publisher is None:
+            return "error", "no publisher"
+        publisher.cancel_calls.append(job_id)
+        return publisher.cancel_outcome, f"{publisher.cancel_outcome} for {job_id}"
+
+    monkeypatch.setattr(publishing_service, "get_status", fake_get_status)
+    monkeypatch.setattr(publishing_service, "cancel_scheduled", fake_cancel)
+    yield
+    _LIVE_PUBLISHERS.clear()
 
 
 def default_records(count=4):
@@ -118,15 +161,28 @@ class TestDiscovery:
         harness.discover()
         assert len(harness.db.list_sources(limit=100)) == before
 
-    def test_quota_exhaustion_parks_discovery_instead_of_looping(self, harness):
-        harness.youtube.raise_on_popular = QuotaExhausted("out of units")
+    def test_quota_exhaustion_parks_that_bucket_instead_of_looping(self, harness):
+        harness.youtube.raise_on_popular = QuotaExhausted("out of units",
+                                                          bucket="general")
         assert harness.discover() is False
-        quota = harness.db.get_quota("youtube")
+        quota = harness.db.get_quota("youtube", "general")
         assert parse_iso(quota["exhausted_until"]) > utcnow()
         # A second attempt must not even reach the API.
         calls_before = harness.youtube.popular_calls
         assert run_async(harness.orchestrator.run_discovery(now=NOW)) is False
         assert harness.youtube.popular_calls == calls_before
+
+    def test_an_exhausted_search_bucket_leaves_chart_discovery_working(self):
+        """Independent allocations: one 403 must not disable the other strategy."""
+        h = Harness(config=base_config(discovery={
+            "strategies": ["most_popular", "niche_search"], "topics": ["chess"]}))
+        h.db.mark_quota_exhausted(utcnow() + timedelta(hours=5), "quotaExceeded",
+                                  bucket="search")
+        assert h.discover() is True
+        assert h.youtube.popular_calls == 1     # chart discovery still ran
+        assert h.youtube.search_calls == 0      # search was skipped
+        assert h.db.list_sources(states=[SourceState.ELIGIBLE], limit=10)
+        h.close()
 
 
 # --- selection and submission ------------------------------------------------
@@ -200,12 +256,25 @@ class TestProcessing:
         harness.tick()
         assert harness.db.get_source_by_job(job_id).state == SourceState.PROCESSING
 
-    def test_completion_moves_the_source_forward(self, harness):
+    def test_completion_schedules_but_does_not_declare_victory(self, harness):
+        """A source is not DONE just because the vendor accepted its clips."""
         job_id = self._submit(harness)
         harness.clip_gen.complete(job_id)
         harness.schedule_only()
         assert harness.db.get_source_by_job(job_id).state == SourceState.CLIPS_SCHEDULED
-        harness.tick()   # dispatch closes it out
+
+        harness.tick()   # dispatches to Upload-Post
+        # Still not DONE: the posts are scheduled with the vendor, not live.
+        assert harness.db.get_source_by_job(job_id).state == SourceState.CLIPS_SCHEDULED
+        assert all(a.state == PublishState.SUBMITTED
+                   for a in harness.db.list_publish_attempts(limit=10))
+
+        # Only once the vendor confirms every clip does the source finish.
+        harness.publisher.set_default_status(status_payload("completed", [
+            platform_result(p, "completed")
+            for p in ("tiktok", "instagram", "youtube")]))
+        harness.db.execute("UPDATE publish_attempt SET next_status_check_at = NULL")
+        harness.tick()
         assert harness.db.get_source_by_job(job_id).state == SourceState.DONE
 
     def test_a_failed_job_is_retried_with_backoff(self, harness):

@@ -15,8 +15,8 @@ from automation.models import ClipState, EngineStatus, PublishState, SourceState
 from automation.ports import Runtime
 from automation.service import AutopilotService
 from autopilot_fakes import (
-    FakeClipGenerator, FakePublisher, FakeYouTubeClient, base_config, make_record,
-    run_async,
+    FakeClipGenerator, FakePublisher, FakeYouTubeClient, base_config, install_fake_vendor,
+    make_record, platform_result, run_async, status_payload,
 )
 
 NOW = datetime(2026, 8, 12, 8, 0, tzinfo=timezone.utc)
@@ -26,6 +26,7 @@ NOW = datetime(2026, 8, 12, 8, 0, tzinfo=timezone.utc)
 def service(tmp_path, monkeypatch):
     monkeypatch.setenv("YOUTUBE_DATA_API_KEY", "test-yt-key")
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("UPLOAD_POST_API_KEY", "test-up-key")
     svc = AutopilotService(db_path=str(tmp_path / "svc.db")).open()
     clip_gen = FakeClipGenerator()
     publisher = FakePublisher()
@@ -35,8 +36,15 @@ def service(tmp_path, monkeypatch):
                                         publisher=publisher.port())
     svc._orchestrator._client_factory = lambda: youtube
     svc.clip_gen, svc.publisher, svc.youtube = clip_gen, publisher, youtube
+    install_fake_vendor(monkeypatch, publisher)
+    # A profile the preflight can resolve, so enabling is possible in tests.
+    svc.update_settings({"publishing": {"upload_post_user": publisher.user}})
     yield svc
     svc.db.close()
+
+
+def enable(service):
+    return run_async(service.enable())
 
 
 class TestSettings:
@@ -65,12 +73,12 @@ class TestSettings:
                                   "discovery": {"strategies": ["niche_search"],
                                                 "topics": []}})
         with pytest.raises(ConfigError):
-            service.enable()
+            enable(service)
 
 
 class TestOperatorActions:
     def test_enable_and_disable_flip_the_stored_flag(self, service):
-        service.enable()
+        enable(service)
         assert service.get_settings()["enabled"] is True
         service.disable()
         assert service.get_settings()["enabled"] is False
@@ -79,45 +87,74 @@ class TestOperatorActions:
         service.db.update_engine_state(engine_status=EngineStatus.PAUSED_ERROR,
                                        consecutive_failures=9,
                                        paused_reason="everything broke")
-        service.enable()
+        enable(service)
         state = service.db.load_engine_state()
         assert state["consecutive_failures"] == 0
         assert state["paused_reason"] is None
 
     def test_pause_is_a_soft_stop(self, service):
-        service.enable()
+        enable(service)
         service.pause()
         assert service.db.load_engine_state()["pause_requested"] == 1
         service.resume()
         assert service.db.load_engine_state()["pause_requested"] == 0
 
-    def test_emergency_stop_cancels_pending_posts_and_disables(self, service):
-        service.enable()
+    def test_emergency_stop_cancels_local_queue_and_disables(self, service):
+        enable(service)
         _run_to_scheduled(service)
         pending = service.db.list_publish_attempts(states=[PublishState.PENDING], limit=10)
         assert pending
 
-        report = service.emergency_stop()
-        assert report["canceled_publishes"] == len(pending)
+        report = run_async(service.emergency_stop(now=NOW))
+        assert report["canceled_local"] == len(pending)
         assert service.get_settings()["enabled"] is False
         assert all(a.state == PublishState.CANCELED
                    for a in service.db.list_publish_attempts(limit=20))
 
-    def test_emergency_stop_does_not_claim_to_unsend_submitted_posts(self, service):
-        """Honesty: once Upload-Post holds it, only Upload-Post can cancel it."""
-        service.enable()
-        _run_to_scheduled(service)
-        attempt = service.db.list_publish_attempts(states=[PublishState.PENDING],
-                                                   limit=1)[0]
-        service.db.set_publish_state(attempt.id, PublishState.SUBMITTED)
+    def test_emergency_stop_cancels_future_vendor_jobs(self, service):
+        """The correction: Upload-Post DOES expose scheduled-job cancellation."""
+        enable(service)
+        attempt = _submitted_attempt(service, hours_ahead=6)
 
-        service.emergency_stop()
+        report = run_async(service.emergency_stop(now=NOW))
+        assert service.publisher.cancel_calls == [attempt.vendor_job_id]
+        assert report["canceled_vendor"] == 1
+        assert service.db.get_publish_attempt(attempt.id).state == PublishState.CANCELED
+
+    def test_a_vendor_404_is_never_reported_as_cancelled(self, service):
+        """It may have already run — saying "cancelled" would be a lie."""
+        enable(service)
+        attempt = _submitted_attempt(service, hours_ahead=6)
+        service.publisher.cancel_outcome = "not_found"
+
+        report = run_async(service.emergency_stop(now=NOW))
+        assert report["canceled_vendor"] == 0
+        assert report["vendor_not_found"] == 1
+        refreshed = service.db.get_publish_attempt(attempt.id)
+        assert refreshed.state == PublishState.UNCERTAIN
+        assert refreshed.next_status_check_at is not None   # reconcile, don't guess
+
+    def test_a_post_whose_slot_already_passed_is_reconciled_not_cancelled(self, service):
+        """It may already be live; cancellation is not the right question."""
+        enable(service)
+        attempt = _submitted_attempt(service, hours_ahead=-1)
+
+        report = run_async(service.emergency_stop(now=NOW))
+        assert service.publisher.cancel_calls == []
+        assert report["already_published"] == 1
         assert service.db.get_publish_attempt(attempt.id).state == PublishState.SUBMITTED
-        note = service.db.recent_events(limit=1)[0]["message"]
-        assert "remain on the Upload-Post calendar" in note
+
+    def test_emergency_stop_never_touches_manual_posts(self, service):
+        """Ownership boundary: only jobs in Autopilot's own table are cancelled."""
+        enable(service)
+        _submitted_attempt(service, hours_ahead=6)
+        run_async(service.emergency_stop(now=NOW))
+        # Every cancelled id came from a publish_attempt row Autopilot created.
+        ours = {a.vendor_job_id for a in service.db.list_publish_attempts(limit=50)}
+        assert set(service.publisher.cancel_calls) <= ours
 
     def test_skip_removes_a_candidate_from_the_queue(self, service):
-        service.enable()
+        enable(service)
         run_async(service.orchestrator.run_discovery(now=NOW, force=True))
         candidate = service.db.list_sources(states=[SourceState.ELIGIBLE], limit=1)[0]
         assert service.skip_source(candidate.id)
@@ -126,7 +163,7 @@ class TestOperatorActions:
         assert not service.skip_source(candidate.id)
 
     def test_a_failed_source_can_be_re_queued(self, service):
-        service.enable()
+        enable(service)
         run_async(service.orchestrator.run_discovery(now=NOW, force=True))
         source = service.db.list_sources(states=[SourceState.ELIGIBLE], limit=1)[0]
         service.db.transition_source(source.id, SourceState.SELECTED)
@@ -141,7 +178,7 @@ class TestOperatorActions:
         assert refreshed.last_error is None
 
     def test_a_failed_publish_can_be_retried(self, service):
-        service.enable()
+        enable(service)
         _run_to_scheduled(service)
         attempt = service.db.list_publish_attempts(limit=1)[0]
         service.db.set_publish_state(attempt.id, PublishState.FAILED, error="nope")
@@ -150,9 +187,10 @@ class TestOperatorActions:
 
     def test_an_uncertain_publish_needs_a_deliberate_decision(self, service):
         """No accidental double-post: plain retry refuses an ambiguous attempt."""
-        service.enable()
+        enable(service)
         _run_to_scheduled(service)
         attempt = service.db.list_publish_attempts(limit=1)[0]
+        service.db.set_publish_state(attempt.id, PublishState.IN_FLIGHT)
         service.db.set_publish_state(attempt.id, PublishState.UNCERTAIN)
 
         assert not service.retry_publish(attempt.id)       # ordinary retry refused
@@ -160,17 +198,41 @@ class TestOperatorActions:
         assert service.db.get_publish_attempt(attempt.id).state == PublishState.PENDING
 
     def test_an_uncertain_publish_can_be_confirmed_as_landed(self, service):
-        service.enable()
+        enable(service)
         _run_to_scheduled(service)
         attempt = service.db.list_publish_attempts(limit=1)[0]
+        service.db.set_publish_state(attempt.id, PublishState.IN_FLIGHT)
         service.db.set_publish_state(attempt.id, PublishState.UNCERTAIN)
 
         assert service.resolve_uncertain(attempt.id)
-        assert service.db.get_publish_attempt(attempt.id).state == PublishState.SUBMITTED
+        refreshed = service.db.get_publish_attempt(attempt.id)
+        assert refreshed.state == PublishState.PUBLISHED
+        # Recorded as a human assertion, not as a vendor confirmation.
+        assert "operator" in (refreshed.error or "").lower()
         assert service.db.get_clip(attempt.clip_id).state == ClipState.PUBLISHED
 
+    def test_a_partial_failure_can_be_accepted_or_abandoned(self, service):
+        enable(service)
+        _run_to_scheduled(service)
+        attempts = service.db.list_publish_attempts(states=[PublishState.PENDING], limit=2)
+        for a in attempts:
+            service.db.set_publish_state(a.id, PublishState.IN_FLIGHT)
+            service.db.set_publish_state(a.id, PublishState.SUBMITTED)
+            service.db.set_publish_state(a.id, PublishState.PARTIAL_FAILED)
+
+        assert service.resolve_uncertain(attempts[0].id)
+        assert service.db.get_publish_attempt(attempts[0].id).state == PublishState.PUBLISHED
+
+        assert service.abandon_attempt(attempts[1].id)
+        assert service.db.get_publish_attempt(attempts[1].id).state == PublishState.FAILED
+        # Neither is re-queued: resending would duplicate the platforms that
+        # already succeeded.
+        requeued = {a.id for a in service.db.list_publish_attempts(
+            states=[PublishState.PENDING], limit=20)}
+        assert requeued.isdisjoint({attempts[0].id, attempts[1].id})
+
     def test_process_next_refuses_while_something_is_running(self, service):
-        service.enable()
+        enable(service)
         run_async(service.orchestrator.run_discovery(now=NOW, force=True))
         assert run_async(service.process_next_now())["ok"] is True
         result = run_async(service.process_next_now())
@@ -180,7 +242,7 @@ class TestOperatorActions:
 
 class TestStatusView:
     def test_answers_the_questions_an_operator_returns_with(self, service):
-        service.enable()
+        enable(service)
         _run_to_scheduled(service)
         status = service.status(now=NOW)
 
@@ -191,11 +253,12 @@ class TestStatusView:
         assert status["today"]["sources_selected"] == 1
         assert status["today"]["clips_generated"] == 3
         assert status["today"]["posts_scheduled"] == 3
+        assert status["today"]["posts_published"] == 0   # nothing confirmed yet
         assert status["publish_attempts"]
         assert status["recent_selected"]
 
     def test_rejected_candidates_are_shown_with_their_reason(self, service, monkeypatch):
-        service.enable()
+        enable(service)
         service.youtube.records = [
             make_record("vid00000001", now=NOW, license="youtube"),
             make_record("vid00000002", now=NOW),
@@ -205,7 +268,7 @@ class TestStatusView:
         assert any(r["rejection_reason"] == "rights_policy" for r in rejected)
 
     def test_the_score_breakdown_travels_with_each_candidate(self, service):
-        service.enable()
+        enable(service)
         run_async(service.orchestrator.run_discovery(now=NOW, force=True))
         candidate = service.status(now=NOW)["queue"][0]
         assert candidate["score"] > 0
@@ -213,7 +276,7 @@ class TestStatusView:
         assert candidate["score_breakdown"]["contributions"]
 
     def test_slots_are_reported_in_local_time_as_well_as_utc(self, service):
-        service.enable()
+        enable(service)
         service.update_settings({"timezone": "Europe/Madrid"})
         _run_to_scheduled(service)
         attempt = service.status(now=NOW)["publish_attempts"][0]
@@ -227,19 +290,26 @@ class TestStatusView:
             "gemini": True, "youtube_data_api": True,
             "upload_post_key": True, "upload_post_user": True}
         blob = repr(status)
-        for secret in ("test-yt-key", "test-gemini-key", "test-key"):
+        for secret in ("test-yt-key", "test-gemini-key", "test-key", "test-up-key"):
             assert secret not in blob
 
-    def test_quota_state_is_visible(self, service):
-        service.db.add_quota_units(101)
+    def test_both_quota_buckets_are_visible(self, service):
+        service.db.add_quota_units(101, bucket="general")
+        service.db.add_quota_units(3, bucket="search")
         quota = service.status(now=NOW)["youtube_quota"]
-        assert quota["units_used_today"] == 101
-        assert quota["daily_budget"] == 10000
-        assert quota["blocked_until"] is None
+        assert quota["general_units_used"] == 101
+        assert quota["search_calls_used"] == 3
+        assert quota["general_budget"] == 10000
+        assert quota["search_budget"] == 100
+        assert quota["general_blocked_until"] is None
+        assert quota["search_blocked_until"] is None
 
-    def test_a_parked_quota_shows_when_it_lifts(self, service):
-        service.db.mark_quota_exhausted(utcnow() + timedelta(hours=4), "quotaExceeded")
-        assert service.status()["youtube_quota"]["blocked_until"]
+    def test_a_parked_bucket_shows_when_it_lifts_without_blocking_the_other(self, service):
+        service.db.mark_quota_exhausted(utcnow() + timedelta(hours=4), "quotaExceeded",
+                                        bucket="search")
+        quota = service.status()["youtube_quota"]
+        assert quota["search_blocked_until"]
+        assert quota["general_blocked_until"] is None
 
     def test_storage_headroom_is_reported(self, service):
         storage = service.status(now=NOW)["storage"]
@@ -272,18 +342,34 @@ class TestSingletonLease:
 
 class TestRetentionIntegration:
     def test_files_awaiting_publication_are_reported_as_in_use(self, service):
-        service.enable()
+        enable(service)
         _run_to_scheduled(service)
         in_use = service.files_in_use()
         assert len(in_use) == 3
         assert all(entry["filename"].endswith(".mp4") for entry in in_use)
 
     def test_nothing_is_pinned_once_everything_is_submitted(self, service):
-        service.enable()
+        """Once the vendor holds the bytes the local clip is expendable —
+        even though the posts are not live yet."""
+        enable(service)
         _run_to_scheduled(service)
         for attempt in service.db.list_publish_attempts(limit=10):
+            service.db.set_publish_state(attempt.id, PublishState.IN_FLIGHT)
             service.db.set_publish_state(attempt.id, PublishState.SUBMITTED)
         assert service.files_in_use() == []
+
+
+def _submitted_attempt(service, *, hours_ahead=6, now=NOW):
+    """One attempt Upload-Post has accepted as a scheduled job."""
+    _run_to_scheduled(service, now=now)
+    attempt = service.db.list_publish_attempts(states=[PublishState.PENDING], limit=1)[0]
+    service.db.execute("UPDATE publish_attempt SET scheduled_for_utc = ? WHERE id = ?",
+                       (iso(now + timedelta(hours=hours_ahead)), attempt.id))
+    service.db.set_publish_state(attempt.id, PublishState.IN_FLIGHT)
+    service.db.set_publish_state(attempt.id, PublishState.SUBMITTED,
+                                 vendor_job_id=f"scheduler_job_{attempt.id}",
+                                 vendor_request_id=f"klippo-{attempt.id}")
+    return service.db.get_publish_attempt(attempt.id)
 
 
 def _run_to_scheduled(service, now=NOW):

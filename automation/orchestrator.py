@@ -44,7 +44,7 @@ class Orchestrator:
 
     # --- startup reconciliation ----------------------------------------------
 
-    def reconcile_on_start(self) -> Dict[str, Any]:
+    def reconcile_on_start(self, *, now: Optional[datetime] = None) -> Dict[str, Any]:
         """Bring persisted state back in line with reality after a restart.
 
         Runs before the first tick and logs everything it changes. It never
@@ -55,7 +55,8 @@ class Orchestrator:
                   "orphan_selections": 0}
         cg = self.runtime.clip_generator
 
-        report["in_flight_publishes"] = publishing.reconcile_in_flight(self.db)
+        report["in_flight_publishes"] = publishing.reconcile_in_flight(
+            self.db, now=now or utcnow())
 
         # A source stuck in SELECTED never got a job id — nothing was submitted,
         # so it is safe (and correct) to put it back in the eligible pool.
@@ -124,6 +125,10 @@ class Orchestrator:
                 actions.append(f"job:{changed}")
 
         actions.extend(await self._schedule_ready_sources(config, now=now))
+        # Ask the vendor about open submissions BEFORE sending anything new:
+        # this is the only path to PUBLISHED, and it also resolves an UNCERTAIN
+        # attempt before a later stage could act on stale information.
+        actions.extend(await self._reconcile_vendor(config, now=now))
         actions.extend(await self._dispatch_publishes(config, now=now))
 
         paused = bool(state.get("pause_requested"))
@@ -158,9 +163,14 @@ class Orchestrator:
         config = config or self.config()
         now = now or utcnow()
 
-        blocked_until = discovery.quota_blocked_until(self.db, now)
-        if blocked_until and not force:
-            return False
+        # Only skip when BOTH buckets are parked: search exhaustion alone still
+        # leaves chart-based discovery perfectly usable.
+        from .youtube_client import BUCKET_GENERAL, BUCKET_SEARCH
+        if not force:
+            search_blocked = self.db.quota_blocked(now, bucket=BUCKET_SEARCH)
+            general_blocked = self.db.quota_blocked(now, bucket=BUCKET_GENERAL)
+            if search_blocked and general_blocked:
+                return False
 
         client = self._client_factory()
         if not client.configured:
@@ -409,15 +419,50 @@ class Orchestrator:
                                                      PublishState.UNCERTAIN):
                     self._record_failure("Publish failed", config)
 
-        # A source is done once none of its clips are waiting on anything.
+        # A source is done only once every clip has genuinely settled. A clip
+        # sitting in SCHEDULED is one the vendor is still holding — calling the
+        # source complete there is what made "published" a lie in v1.
         for source in self.db.list_sources(states=[SourceState.CLIPS_SCHEDULED], limit=20):
             clips = self.db.list_clips(source_id=source.id)
-            if clips and all(c.state in (ClipState.PUBLISHED, ClipState.SKIPPED,
-                                         ClipState.FAILED) for c in clips):
+            if clips and all(c.state in ClipState.SETTLED for c in clips):
                 self.db.transition_source(source.id, SourceState.DONE,
                                           expected=[SourceState.CLIPS_SCHEDULED])
-                self.db.log_event("publishing", "All clips handled — source complete",
-                                  source_id=source.id, job_id=source.job_id)
+                published = sum(1 for c in clips if c.state == ClipState.PUBLISHED)
+                self.db.log_event(
+                    "publishing",
+                    f"Source complete — {published}/{len(clips)} clip(s) confirmed published",
+                    source_id=source.id, job_id=source.job_id)
+        return actions
+
+    async def _reconcile_vendor(self, config: Dict[str, Any], *,
+                                now: datetime) -> List[str]:
+        """Poll Upload-Post for attempts whose outcome is still open.
+
+        Cadence comes from the persisted ``next_status_check_at``, so a restart
+        resumes the vendor's recommended intervals instead of re-polling
+        everything at once.
+        """
+        publisher = self.runtime.publisher
+        actions: List[str] = []
+        if publisher is None:
+            return actions
+        api_key, _profile = publisher.credentials()
+        if not api_key:
+            return actions
+
+        from . import publishing
+        due = self.db.attempts_due_for_status_check(now, limit=8)
+        for attempt in due:
+            try:
+                new_state = await publishing.reconcile_attempt(
+                    self.db, attempt, api_key=api_key, now=now)
+            except Exception as exc:
+                self.db.log_event("publishing", f"Reconciliation error: {exc}",
+                                  level="warn", source_id=attempt.source_id,
+                                  publish_attempt_id=attempt.id)
+                continue
+            if new_state:
+                actions.append(f"reconciled:{attempt.id}:{new_state}")
         return actions
 
     # --- circuit breaker ------------------------------------------------------

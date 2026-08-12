@@ -248,10 +248,11 @@ UPLOAD_POST_USER=...          # WHICH Upload-Post profile to post as
 → new project → *APIs & Services* → enable **YouTube Data API v3** →
 *Credentials* → **Create API key**. Restrict it to that one API.
 
-Quota is the thing to watch: the free tier is 10,000 units/day. A "trending"
-discovery run costs ~1 unit; each keyword topic costs 100. The dashboard shows
-what you have spent today, and Autopilot parks itself until the reset rather
-than retrying into an empty quota.
+Quota is the thing to watch, and it is **two separate allowances**: ~10,000
+general units/day (a trending discovery run costs ~1) and ~100 search calls/day
+(one per configured topic per run). They are independent — running out of search
+does not stop trending discovery. The dashboard shows both, and Autopilot parks
+the exhausted bucket until its reset rather than retrying into a 403.
 
 **3. Upload-Post for unattended posting.** Set up the profile as usual
 (see [Social Media Setup](#social-media-setup-upload-post)), then put its
@@ -328,6 +329,35 @@ Hard limits, because unattended software spends money:
 - A low-quality source is **skipped with a reason** — Autopilot never enters the
   interactive "process at 360p anyway?" confirmation manual mode uses.
 
+### Publishing lifecycle — accepted is not published
+
+Upload-Post returning `2xx` means **it accepted the job**, not that anything is
+live. For a post scheduled three days out nothing exists on any platform yet.
+Klippo tracks the two separately and only ever claims "published" when the
+vendor's status endpoint says so:
+
+```
+PENDING ─▶ IN_FLIGHT ─▶ SUBMITTED ─▶ PUBLISHING ─▶ PUBLISHED
+              │             │            ├────────▶ PARTIAL_FAILED
+              │             │            └────────▶ FAILED
+              │             └──────────────────────▶ CANCELED
+              └──▶ UNCERTAIN ──(status lookup)──▶ resolved
+```
+
+| Dashboard label | What it actually means |
+|---|---|
+| queued locally | Klippo has the slot; nothing sent yet |
+| scheduled with upload-post | Vendor accepted it. **Not live.** |
+| publishing now | Vendor is pushing to the platforms |
+| published | Vendor confirmed **every** selected platform succeeded |
+| partial failure | Live on some platforms, failed on others |
+| needs attention | Outcome unknown — Klippo will not resend on its own |
+
+**Partial failures are never retried automatically.** If YouTube and TikTok
+succeeded and Instagram failed, resending the request would publish it twice
+where it already worked. The dashboard shows the per-platform result and lets
+you post the failed one by hand, then close it out.
+
 ### Restart and downtime behaviour
 
 State lives in SQLite (WAL, foreign keys, unique constraints), on a persistent
@@ -338,9 +368,10 @@ Docker volume. On startup Autopilot reconciles what it finds:
 | during discovery | Nothing lost, nothing duplicated — sources are keyed by YouTube `videoId`. |
 | while processing | Reattaches to the same Klippo job. It is never resubmitted. |
 | after processing, before scheduling | Scheduling resumes. Clips are keyed by `(job_id, clip_index)`. |
-| after scheduling | Nothing is re-sent; the slot is already claimed. |
-| **mid-upload** | The attempt is marked **UNCERTAIN** and is *never* auto-retried. Upload-Post has no idempotency key, so a blind retry could post twice. You resolve it from the dashboard. |
-| machine asleep past a slot | Catch-up policy applies — by default the clip moves to the next free slot. It never bursts every overdue post at once. |
+| after scheduling | Nothing is re-sent; the vendor already holds the job. |
+| **mid-upload** | Marked **UNCERTAIN** and never blindly resent. Klippo sends its own `request_id` with every upload (a documented Upload-Post parameter for exactly this case), so the next tick *asks* the vendor what happened: unknown to them → safe to resend; known → reconciled to its real state. |
+| after the vendor completed but before we recorded it | The next status check picks it up and marks it published. |
+| machine asleep past a slot | The vendor holds scheduled posts, so they still fire. A post never submitted uses the catch-up policy — by default the next free slot, never a burst. |
 
 ### Running it on a dedicated Mac
 
@@ -361,11 +392,30 @@ docker compose exec backend python ops/benchmark.py --url "https://youtu.be/..."
 ### Turning it off
 
 Dashboard → Autopilot → **Pause** (finish current, start nothing new) →
-**Disable** (stop the engine) → **Emergency stop** (also cancels every post not
-yet sent). Or `AUTOPILOT_ENABLED=0` in `.env` to remove the subsystem entirely.
+**Disable** (stop the engine) → **Emergency stop**. Or `AUTOPILOT_ENABLED=0` in
+`.env` to remove the subsystem entirely.
 
-Posts Upload-Post has already accepted stay on its calendar — only Upload-Post
-can cancel those, and Klippo says so rather than pretending otherwise.
+Emergency stop does all of this, in order: disables the engine, drops everything
+still queued locally, then calls Upload-Post's scheduled-job cancellation for
+every future post it is holding for Klippo. A job is marked cancelled **only when
+the vendor confirms it** — a 404 means "unknown or already executed", which is
+not a cancellation, so that attempt is re-checked instead. A post whose slot has
+already passed is reconciled rather than cancelled, because it may already be
+live. Manual Mode posts are never touched: only jobs Autopilot itself submitted
+are in its database.
+
+### YouTube quota
+
+Since 1-jun-2026 the Data API bills **two independent allocations**, and Klippo
+tracks them separately:
+
+| Bucket | Default/day | Used by |
+|---|---|---|
+| general units | 10,000 | `videos.list` (1 unit) — trending discovery, hydration |
+| search queries | ~100 calls | `search.list` (1 unit) — niche topic search |
+
+Exhausting one does not stop the other: if the search allocation runs out,
+trending discovery keeps working. The dashboard shows both.
 
 ### Troubleshooting
 
@@ -374,9 +424,11 @@ can cancel those, and Klippo says so rather than pretending otherwise.
 | Tab missing | `AUTOPILOT_ENABLED=0`, or you are running in cloud/billing mode where it is off by design. |
 | "Missing server-side credentials" | A key is only in the browser. Autopilot needs it in `.env`. |
 | Nothing is ever eligible | Usually the rights policy: with the CC-only default, most trending videos are standard-licence. Check the **not used** list — every rejection carries its reason. |
-| "quota exhausted" | Too many keyword topics. Each costs 100 of 10,000 daily units. |
+| "search blocked until…" | The ~100/day search allocation is spent — usually too many topics. Trending discovery keeps working. |
 | Stuck at "waiting for the clip queue" | A manual job is occupying the pipeline. Autopilot waits by design. |
-| Publish attempt shows UNCERTAIN | The backend died mid-upload. Check the Upload-Post calendar, then tell the dashboard which way it went. |
+| Publish attempt shows "needs attention" | Either the outcome was unknown (Klippo will try to resolve it against the vendor automatically) or a platform failed while others succeeded. Check the per-platform detail in the dashboard. |
+| A post says "scheduled with upload-post" for days | That is correct — it is waiting for its slot. It becomes "published" after the vendor runs it and Klippo confirms. |
+| "search blocked until…" but discovery still runs | Expected: the two YouTube allocations are independent, so trending discovery continues. |
 
 ---
 

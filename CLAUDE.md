@@ -55,7 +55,7 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 | `s3_uploader.py` | AWS S3 upload with caching |
 | `subtitles.py` | SRT generation, FFmpeg subtitle burning, and dubbed video transcription |
 | `translate.py` | ElevenLabs dubbing API for AI voice translation |
-| `publishing_service.py` | **The one** Upload-Post implementation — payload construction + streaming multipart upload. Used by `/api/social/post`, `/api/saasshorts/post` and Autopilot. Never build the payload anywhere else. |
+| `publishing_service.py` | **The one** Upload-Post implementation — payload construction, streaming multipart upload, status reconciliation, scheduled-job listing/cancellation. Used by `/api/social/post`, `/api/saasshorts/post`, `/api/thumbnail/publish` and Autopilot. No other module may speak HTTP to Upload-Post. |
 | `automation/` | Autopilot: the unattended content engine (see below) |
 | `ops/healthcheck.py` | Machine fitness check for a dedicated Autopilot Mac |
 | `ops/benchmark.py` | Memory/CPU/disk cost of one real source on this machine |
@@ -89,9 +89,22 @@ Rules that are load-bearing — breaking one reintroduces a class of bug:
 - **One heavy pipeline at a time**, enforced from Autopilot's own state so a
   raised `MAX_CONCURRENT_JOBS` cannot melt the machine.
 - **Timezones**: store UTC, convert only at the boundary, validate the IANA name.
-- **`PublishState.UNCERTAIN` is never auto-retried.** Upload-Post has no
-  idempotency key, so retrying an ambiguous outcome can double-post. A human
-  resolves it. Do not "fix" this by adding a retry.
+- **Vendor acceptance is not publication.** A 2xx from `/api/upload` means
+  Upload-Post accepted the job. `PublishState.SUBMITTED` says exactly that;
+  `PUBLISHED` is reached only through a `/uploadposts/status` check. Never set
+  `ClipState.PUBLISHED` on acceptance — that was the v1 bug.
+- **`PublishState.UNCERTAIN` is never blindly re-POSTed.** Klippo sends its own
+  `request_id` (a documented Upload-Post parameter) before every upload, so an
+  ambiguous timeout is *resolved by asking* the status endpoint, not by
+  resending. Do not "fix" this by adding a plain retry.
+- **`PARTIAL_FAILED` is never auto-retried at all.** Some platforms are already
+  live; resending duplicates them. A human decides.
+- **YouTube quota has two independent buckets** (`general` 10k units,
+  `search` ~100 calls/day). Never collapse them: exhausting search must not stop
+  chart discovery. `search.list` requires `part=snippet`.
+- **The rights policy alone decides the search licence filter**
+  (`eligibility.search_requires_creative_commons`). Never reintroduce a separate
+  `creative_commons_search_only` switch — the two could contradict.
 - **Rights**: Autopilot carries a persistent Source Rights Policy and records it
   with every processed source. It must never synthesise manual mode's
   acknowledgement checkbox.

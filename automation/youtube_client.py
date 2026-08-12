@@ -5,13 +5,20 @@ YouTube's terms. Everything the orchestrator needs (charts, search, statistics)
 goes through this client so retries, timeouts, quota accounting and response
 validation exist exactly once.
 
-Quota costs (units, per the Data API documentation):
-  videos.list          1
-  search.list        100
-  videoCategories.list 1
-The daily default allowance is 10,000 units, so a naive "search on every tick"
-design exhausts a key before lunch. Discovery is therefore scheduled, batched
-(50 ids per videos.list) and hard-stopped by the caller's page budget.
+Quota, verified against developers.google.com (checked 12-aug-2026) rather than
+carried over from an older model: the API bills **separate daily allocations**,
+not one pool.
+
+  bucket "general"  — 10,000 units/day, shared by every endpoint below
+                      videos.list = 1 unit, videoCategories.list = 1 unit
+  bucket "search"   — its own allocation, ~100 search.list calls/day
+                      search.list = 1 unit *in that bucket*
+
+They are independent: exhausting the search allocation returns 403 on
+search.list while videos.list keeps working on a general pool that still has
+thousands of units. Charging search 100 units against "general" — the previous
+model here — both overstated general usage and wrongly disabled chart discovery
+when only search ran out.
 """
 from __future__ import annotations
 
@@ -27,9 +34,16 @@ import httpx
 
 API_BASE = "https://www.googleapis.com/youtube/v3"
 
+BUCKET_GENERAL = "general"
+BUCKET_SEARCH = "search"
+
+# (cost, bucket) per method.
 COST_VIDEOS_LIST = 1
-COST_SEARCH_LIST = 100
+COST_SEARCH_LIST = 1          # 1 unit against the SEARCH bucket, not 100 general
 COST_CATEGORIES_LIST = 1
+# Default daily allocations, used for the dashboard's "x of y" readout.
+DEFAULT_GENERAL_UNITS = 10000
+DEFAULT_SEARCH_CALLS = 100
 
 _ISO_DURATION_RE = re.compile(
     r"^P(?:(?P<days>\d+)D)?"
@@ -49,10 +63,16 @@ class YouTubeError(RuntimeError):
 
 
 class QuotaExhausted(YouTubeError):
-    """The API key is out of daily quota (or rate-limited)."""
+    """One quota BUCKET is exhausted (or rate-limited).
 
-    def __init__(self, message: str, *, reason: str = "quotaExceeded"):
+    ``bucket`` says which. Parking the whole provider on a search exhaustion
+    would needlessly stop chart discovery, which draws from a different pool.
+    """
+
+    def __init__(self, message: str, *, reason: str = "quotaExceeded",
+                 bucket: str = "general"):
         super().__init__(message, status=403, reason=reason, retryable=False)
+        self.bucket = bucket
 
 
 def parse_iso8601_duration(text: Optional[str]) -> int:
@@ -212,6 +232,7 @@ class YouTubeClient:
     def __init__(self, api_key: Optional[str] = None, *, timeout: float = 20.0,
                  max_retries: int = 3, on_units=None,
                  client: Optional[httpx.AsyncClient] = None):
+        # on_units(units, bucket) — the bucket matters, see the module docstring.
         self.api_key = api_key or os.environ.get("YOUTUBE_DATA_API_KEY") or ""
         self.timeout = timeout
         self.max_retries = max_retries
@@ -234,7 +255,8 @@ class YouTubeClient:
             await self._client.aclose()
             self._client = None
 
-    async def _get(self, path: str, params: Dict[str, Any], cost: int) -> Dict[str, Any]:
+    async def _get(self, path: str, params: Dict[str, Any], cost: int,
+                   bucket: str = BUCKET_GENERAL) -> Dict[str, Any]:
         if not self.api_key:
             raise YouTubeError("YOUTUBE_DATA_API_KEY is not configured")
         if self._client is None:
@@ -256,7 +278,7 @@ class YouTubeClient:
 
             if resp.status_code == 200:
                 if self._on_units:
-                    self._on_units(cost)
+                    self._on_units(cost, bucket)
                 try:
                     data = resp.json()
                 except ValueError:
@@ -271,7 +293,7 @@ class YouTubeClient:
                     "userRateLimitExceeded"):
                 # Never retried: the key is out of units. Retrying is what turns
                 # an exhausted quota into a hot loop.
-                raise QuotaExhausted(f"{path}: {reason}", reason=reason)
+                raise QuotaExhausted(f"{path}: {reason}", reason=reason, bucket=bucket)
             if resp.status_code in (500, 502, 503, 504) or resp.status_code == 429:
                 last_error = YouTubeError(f"{path}: HTTP {resp.status_code}",
                                           status=resp.status_code, reason=reason,
@@ -332,9 +354,15 @@ class YouTubeClient:
                                published_after: Optional[datetime] = None,
                                max_results: int = 25,
                                creative_commons: bool = False) -> List[str]:
-        """``search.list`` — 100 units per call, so one call per topic per run."""
+        """``search.list`` — 1 unit from the SEARCH bucket (~100 calls/day).
+
+        ``part`` must be ``snippet``: the current API documents that value as
+        required for this method, and ``part=id`` — which this client used to
+        send — is not accepted. We still read only the ids here; the statistics
+        and contentDetails come from a much cheaper videos.list batch.
+        """
         params: Dict[str, Any] = {
-            "part": "id",
+            "part": "snippet",
             "type": "video",
             "q": query[:200],
             "order": "viewCount",
@@ -349,7 +377,7 @@ class YouTubeClient:
         if creative_commons:
             params["videoLicense"] = "creativeCommon"
 
-        data = await self._get("search", params, COST_SEARCH_LIST)
+        data = await self._get("search", params, COST_SEARCH_LIST, bucket=BUCKET_SEARCH)
         ids: List[str] = []
         for item in data.get("items") or []:
             if not isinstance(item, dict):

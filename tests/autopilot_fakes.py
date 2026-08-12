@@ -137,32 +137,111 @@ class FakeClipGenerator:
 
 
 class FakePublisher:
-    """Records every publish call; can be told to fail in specific ways."""
+    """Models the real Upload-Post contract, not a boolean.
+
+    ``/upload`` returns an identifier and NOTHING else is implied — the status
+    endpoint is what later says whether anything went live. ``status_script``
+    lets a test walk an attempt through queued → processing → completed, or
+    straight to a mixed per-platform outcome.
+    """
 
     def __init__(self, *, api_key: str = "test-key", user: str = "test-profile"):
         self.calls: List[Dict[str, Any]] = []
+        self.status_calls: List[Dict[str, Any]] = []
+        self.cancel_calls: List[str] = []
         self.api_key = api_key
         self.user = user
         self.mode = "ok"        # ok | fail | fail_permanent | uncertain
         self.fail_times = 0
+        self.scheduled = True   # return a job_id (scheduled) vs request_id (async)
+        self.profiles = [{"username": user,
+                          "connected": ["tiktok", "instagram", "youtube"]}]
+        # request_id/job_id -> list of status payloads, consumed in order
+        self.status_script: Dict[str, List[Dict[str, Any]]] = {}
+        self.default_status: Optional[Dict[str, Any]] = None
+        self.cancel_outcome = "canceled"
+        self._seq = 0
 
     async def publish(self, **kwargs) -> Dict[str, Any]:
         from publishing_service import PublishError, PublishUncertain
         self.calls.append(kwargs)
+        request_id = kwargs.get("request_id")
         if self.mode == "uncertain":
-            raise PublishUncertain("no answer from the vendor")
+            raise PublishUncertain("no answer from the vendor", request_id=request_id)
         if self.mode == "fail" and self.fail_times > 0:
             self.fail_times -= 1
             raise PublishError("temporary vendor error", status=503, retryable=True)
         if self.mode == "fail_permanent":
             raise PublishError("bad request", status=400, retryable=False)
-        return {"success": True, "id": f"vendor-{len(self.calls)}"}
+        self._seq += 1
+        job_id = f"scheduler_job_{self._seq}" if self.scheduled else None
+        return {"response": {"success": True, "request_id": request_id, "job_id": job_id},
+                "request_id": request_id, "job_id": job_id,
+                "status_code": 202 if self.scheduled else 200}
 
     def credentials(self):
         return (self.api_key, self.user)
 
+    async def list_profiles(self):
+        return list(self.profiles)
+
     def port(self) -> PublisherPort:
-        return PublisherPort(publish=self.publish, credentials=self.credentials)
+        return PublisherPort(publish=self.publish, credentials=self.credentials,
+                             list_profiles=self.list_profiles)
+
+    # --- vendor status scripting ---
+    def script(self, tracking_id: str, *payloads: Dict[str, Any]) -> None:
+        self.status_script[tracking_id] = list(payloads)
+
+    def set_default_status(self, payload: Optional[Dict[str, Any]]) -> None:
+        self.default_status = payload
+
+    def next_status(self, request_id=None, job_id=None) -> Dict[str, Any]:
+        key = job_id or request_id
+        self.status_calls.append({"request_id": request_id, "job_id": job_id})
+        queue = self.status_script.get(key)
+        if queue:
+            return queue.pop(0) if len(queue) > 1 else queue[0]
+        if self.default_status is not None:
+            return self.default_status
+        return {"status": "pending", "completed": 0, "total": 3, "results": []}
+
+
+def status_payload(status: str, results=None, **extra) -> Dict[str, Any]:
+    """Build an Upload-Post status body in the documented shape."""
+    payload = {"status": status, "results": results or [],
+               "completed": sum(1 for r in (results or [])
+                                if r.get("status") == "completed"),
+               "total": len(results or [])}
+    payload.update(extra)
+    return payload
+
+
+def platform_result(platform: str, status: str, message: str = "") -> Dict[str, Any]:
+    return {"platform": platform, "status": status,
+            "success": True if status == "completed" else (
+                False if status == "failed" else None),
+            "message": message or status.title(),
+            "upload_timestamp": "2026-08-12T12:00:00Z"}
+
+
+def install_fake_vendor(monkeypatch, publisher: "FakePublisher"):
+    """Point publishing_service's status/cancel calls at the fake."""
+    import publishing_service
+
+    async def fake_get_status(api_key, *, request_id=None, job_id=None, timeout=30.0):
+        payload = publisher.next_status(request_id=request_id, job_id=job_id)
+        http = 404 if payload.get("status") == "not_found" else 200
+        return publishing_service.parse_status(payload, http_status=http)
+
+    async def fake_cancel(api_key, job_id, *, timeout=30.0):
+        publisher.cancel_calls.append(job_id)
+        outcome = publisher.cancel_outcome
+        return outcome, f"{outcome} for {job_id}"
+
+    monkeypatch.setattr(publishing_service, "get_status", fake_get_status)
+    monkeypatch.setattr(publishing_service, "cancel_scheduled", fake_cancel)
+    return publisher
 
 
 class FakeYouTubeClient:

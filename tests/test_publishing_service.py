@@ -190,7 +190,9 @@ class TestSourceLevelGuarantees:
         # The previous inline implementation did `file_content = f.read()`, which
         # buffers a whole clip in RAM on an 8 GB machine already running Whisper.
         assert "f.read()" not in body and "handle.read()" not in body
-        assert '"video": (filename, handle, "video/mp4")' in body
+        assert "vf.read()" not in body and "tf.read()" not in body
+        # Every part is a file HANDLE handed to httpx, which streams it.
+        assert "files[field_name] = (os.path.basename(path), handle, mime)" in body
 
     def test_the_blocking_call_runs_off_the_event_loop(self):
         body = _code_of(REPO / "publishing_service.py")
@@ -210,10 +212,37 @@ class TestSourceLevelGuarantees:
                       '"media_type"'):
             assert field not in app_source, f"{field} is built in two places again"
 
-    def test_every_clip_publisher_calls_the_shared_service(self):
+    def test_every_publisher_calls_the_shared_service(self):
         app_source = _code_of(REPO / "app.py")
-        # /api/social/post, /api/saasshorts/post and the Autopilot adapter.
-        assert app_source.count("publishing_service.publish(") == 3
+        # /api/social/post, /api/saasshorts/post, /api/thumbnail/publish and
+        # the Autopilot adapter.
+        assert app_source.count("publishing_service.publish(") == 4
+
+    def test_no_upload_post_http_outside_the_shared_service(self):
+        """The static guarantee: one module speaks to Upload-Post.
+
+        Autopilot must never build its own vendor call, and neither may any
+        endpoint — a second construction is how the callers drift apart.
+        """
+        offenders = []
+        for path in [REPO / "app.py", *(REPO / "automation").glob("*.py")]:
+            body = _code_of(path)
+            if "api.upload-post.com" in body:
+                offenders.append(path.name)
+        assert offenders == [], f"Upload-Post HTTP built outside publishing_service: {offenders}"
+
+    def test_no_direct_social_platform_publishing_anywhere(self):
+        """Publishing goes through Upload-Post — never straight to a platform."""
+        banned = ["videos.insert", "googleapis.com/upload/youtube",
+                  "graph.facebook.com", "graph.instagram.com",
+                  "open.tiktokapis.com", "business-api.tiktok.com",
+                  "auth/youtube.upload"]
+        hits = []
+        for path in [REPO / "app.py", REPO / "publishing_service.py",
+                     *(REPO / "automation").glob("*.py")]:
+            body = _code_of(path)
+            hits += [f"{path.name}:{needle}" for needle in banned if needle in body]
+        assert hits == [], f"Direct social publishing found: {hits}"
 
     def test_autopilot_submits_through_the_shared_job_path(self):
         app_source = _code_of(REPO / "app.py")
