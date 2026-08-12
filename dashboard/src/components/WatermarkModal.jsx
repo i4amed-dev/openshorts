@@ -23,7 +23,7 @@ export default function WatermarkModal({ onClose, onContinue }) {
   return (
     <Modal isOpen onClose={() => close(false)} eyebrow="FREE PLAN" title="Upgrade to remove the watermark" size="md">
       <p className="text-muted text-sm mb-4">
-        Clips on the free plan carry the OpenShorts mark in the corner, and are
+        Clips on the free plan carry the Klippo mark in the corner, and are
         kept for 7 days. Any paid plan exports them clean and keeps them for good.
       </p>
 

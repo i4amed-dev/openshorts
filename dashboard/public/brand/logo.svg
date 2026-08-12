@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 56" width="220" height="56" role="img" aria-label="Klippo">
+  <title>Klippo</title>
+  <rect x="4" y="6" width="44" height="44" rx="13" fill="none" stroke="#219ebc" stroke-width="4.5"/>
+  <path d="M20 19 L20 37 M20 28 L31 19 M20 28 L31 37" fill="none" stroke="#219ebc"
+        stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="62" y="38" font-family="Geist, Inter, system-ui, -apple-system, sans-serif"
+        font-size="30" font-weight="600" fill="#219ebc" letter-spacing="-0.5">Klippo</text>
+</svg>

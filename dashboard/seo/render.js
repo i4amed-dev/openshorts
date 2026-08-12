@@ -178,11 +178,10 @@ const buildGraph = (page) => {
 
 const NAV = `
 <header class="site"><div class="wrap">
-  <a class="brand" href="${SITE.url}/"><img src="/logo-openshorts.png" alt="OpenShorts logo" width="26" height="26">OpenShorts</a>
+  <a class="brand" href="${SITE.url}/"><img src="/brand/favicon.svg" alt="Klippo logo" width="26" height="26">Klippo</a>
   <nav class="nav">
     <a href="/free-ai-clip-generator">Clip generator</a>
     <a href="/alternatives/opus-clip">Alternatives</a>
-    <a href="${SITE.repo}" rel="noopener">GitHub</a>
   </nav>
   <a class="cta" href="${SITE.url}/">Get free clips</a>
 </div></header>`
@@ -190,13 +189,12 @@ const NAV = `
 const footer = (related) => `
 <footer class="site"><div class="wrap">
   <div class="row">
-    <a href="${SITE.url}/">OpenShorts</a>
-    <a href="${SITE.repo}" rel="noopener">Source on GitHub</a>
+    <a href="${SITE.url}/">Klippo</a>
     <a href="/free-ai-clip-generator">Free AI clip generator</a>
-    <a href="/open-source-video-clipper">Open source video clipper</a>
-    <a href="/how-openshorts-works">How it works</a>
+    <a href="/self-hosted-video-clipper">Self-hosted video clipper</a>
+    <a href="/how-klippo-works">How it works</a>
   </div>
-  <p>OpenShorts self-hosted is free and open source under MIT. OpenShorts Cloud
+  <p>Klippo self-hosted is free to run yourself. Klippo Cloud
   is the hosted service: 20 free minutes a month, paid plans from $12/month.
   Last updated ${esc(SITE.updated)}.</p>
 </div></footer>`
@@ -233,7 +231,7 @@ export function renderPage(page, related = []) {
 ${page.noindex ? '' : `<link rel="canonical" href="${canonical}">\n`}<meta name="robots" content="${
     page.noindex ? 'noindex,follow' : 'index,follow,max-image-preview:large,max-snippet:-1'
   }">
-<link rel="icon" type="image/png" href="/logo-openshorts.png">
+<link rel="icon" type="image/svg+xml" href="/brand/favicon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif&family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -262,7 +260,7 @@ ${
   page.noindex
     ? ''
     : `<div class="byline">
-  By the OpenShorts team<span class="sep">·</span>
+  By the Klippo team<span class="sep">·</span>
   Published <time datetime="${esc(page.published || SITE.published)}">${esc(page.published || SITE.published)}</time><span class="sep">·</span>
   Updated <time datetime="${esc(page.updated || SITE.updated)}">${esc(page.updated || SITE.updated)}</time>
 </div>`

@@ -2,8 +2,7 @@ import React from 'react';
 import { ArrowLeft } from 'lucide-react';
 
 const LAST_UPDATED = '2026-07-15';
-const ISSUES_URL = 'https://github.com/mutonby/openshorts/issues';
-const SUPPORT_EMAIL = 'info@openshorts.app';
+const SUPPORT_EMAIL = 'info@klippo.one';
 
 function Section({ title, children }) {
     return (
@@ -47,15 +46,15 @@ export default function Legal() {
 
                 <Section title="The short version">
                     <p>
-                        OpenShorts is an AI clip generator. There are two ways to use it:
+                        Klippo is an AI clip generator. There are two ways to use it:
                     </p>
                     <ul className="list-disc pl-6 space-y-2">
                         <li>
-                            <strong className="text-ink">Self-hosted (free):</strong> the open-source software, run on
+                            <strong className="text-ink">Self-hosted (free):</strong> the software, run on
                             your own machine with your own API keys. No account, no payment, no data held by us.
                         </li>
                         <li>
-                            <strong className="text-ink">Hosted at openshorts.app:</strong> we run everything for
+                            <strong className="text-ink">Hosted at klippo.one:</strong> we run everything for
                             you. It requires an account and offers a free plan and paid subscriptions; we store the
                             videos you generate subject to the retention rules below.
                         </li>
@@ -133,7 +132,7 @@ export default function Legal() {
                     </ul>
                     <p>
                         If you submit content you do not have rights to, that is your responsibility. You agree to
-                        indemnify OpenShorts and its contributors against any third-party claim arising from content you
+                        indemnify Klippo and its contributors against any third-party claim arising from content you
                         submitted. We may suspend or terminate accounts that abuse the Service or infringe others' rights.
                     </p>
                 </Section>
@@ -220,8 +219,8 @@ export default function Legal() {
 
                 <Section title="Self-hosted instances">
                     <p>
-                        OpenShorts is open source and may be self-hosted. This notice applies to the hosted version we
-                        operate at openshorts.app. Self-hosted instances are run by their administrators, whose data
+                        Klippo may be self-hosted. This notice applies to the hosted version we
+                        operate at klippo.one. Self-hosted instances are run by their administrators, whose data
                         handling and policies are their own responsibility, not ours.
                     </p>
                 </Section>
@@ -231,11 +230,7 @@ export default function Legal() {
                         We may update this notice; the "Last updated" date reflects the latest revision. For material
                         changes affecting paid subscribers we'll give reasonable notice. Continued use after a change
                         constitutes acceptance. Questions:{' '}
-                        <A href={`mailto:${SUPPORT_EMAIL}`}>{SUPPORT_EMAIL}</A> or{' '}
-                        <A href={ISSUES_URL} external>
-                            GitHub Issues
-                        </A>
-                        .
+                        <A href={`mailto:${SUPPORT_EMAIL}`}>{SUPPORT_EMAIL}</A>.
                     </p>
                     <p>These terms are governed by the laws of Spain.</p>
                 </Section>

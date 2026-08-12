@@ -1,19 +1,14 @@
-# OpenShorts.app
+# Klippo
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Open Source](https://badges.frapsoft.com/os/v1/open-source.svg?v=103)](https://opensource.org/)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](http://makeapullrequest.com)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://docs.docker.com/compose/)
-[![GitHub stars](https://img.shields.io/github/stars/mutonby/openshorts?style=social)](https://github.com/mutonby/openshorts)
-[![Last Commit](https://img.shields.io/github/last-commit/mutonby/openshorts)](https://github.com/mutonby/openshorts/commits/main)
 
-**Open source AI video platform** with 3 tools in one: **Clip Generator**, **AI Shorts (UGC videos with AI actors)**, and **YouTube Studio**.
+**AI video platform** with 3 tools in one: **Clip Generator**, **AI Shorts (UGC videos with AI actors)**, and **YouTube Studio**.
 
 **Two ways to run it, same software either way:**
 
-|  | Self-hosted (this repo) | Hosted on [openshorts.app](https://www.openshorts.app/) |
+|  | Self-hosted (this repo) | Hosted on [klippo.one](https://klippo.one/) |
 |---|---|---|
-| **Price** | Free forever, MIT | Free plan, paid from $12/mo |
+| **Price** | Free forever | Free plan, paid from $12/mo |
 | **Speed** | 5 to 8 min per 8-min video on CPU | About 50s on our NVIDIA GPU |
 | **API keys** | Bring your own Gemini, ElevenLabs, fal.ai | Gemini included, nothing to set up |
 | **Watermark / limits** | None, ever | Watermark and 20 min/mo on the free plan, neither on paid |
@@ -27,7 +22,7 @@ https://github.com/user-attachments/assets/b45fa983-16b4-48b5-ac5b-a267836b9ad9
 
 
 ### Video Tutorial: How it works
-[![OpenShorts Tutorial](https://img.youtube.com/vi/xlyjD1qCaX0/maxresdefault.jpg)](https://www.youtube.com/watch?v=xlyjD1qCaX0 "Click to watch the video on YouTube")
+[![Klippo Tutorial](https://img.youtube.com/vi/xlyjD1qCaX0/maxresdefault.jpg)](https://www.youtube.com/watch?v=xlyjD1qCaX0 "Click to watch the video on YouTube")
 
 *Click the image above to watch the full walkthrough.*
 
@@ -102,7 +97,7 @@ All generated videos and avatars are saved to a public gallery with SEO pages fo
 
 ### Social Auto-Publishing
 - **One-click posting** to TikTok, Instagram Reels, and YouTube Shorts simultaneously
-- **Schedule uploads** for any date and time — plan your content calendar and let OpenShorts publish automatically
+- **Schedule uploads** for any date and time — plan your content calendar and let Klippo publish automatically
 - **Multi-platform distribution** — publish to all your social networks at once from a single interface
 - Upload-Post integration with async uploads
 
@@ -127,24 +122,24 @@ All generated videos and avatars are saved to a public gallery with SEO pages fo
 
 ## AI Shorts Showcase
 
-Videos generated with OpenShorts AI Shorts — no camera, no studio, no actors:
+Videos generated with Klippo AI Shorts — no camera, no studio, no actors:
 
 | | | |
 |:---:|:---:|:---:|
-| [![Biohacking for Investors](https://test-videos-upload-post.s3.eu-west-3.amazonaws.com/videos/cdceec1b/actor.png)](https://openshorts.app/video/cdceec1b) | [![Secret Weapon for Devs](https://test-videos-upload-post.s3.eu-west-3.amazonaws.com/videos/d3a80b6b/actor.png)](https://openshorts.app/video/d3a80b6b) | [![El Secreto de los Agentes de IA](https://test-videos-upload-post.s3.eu-west-3.amazonaws.com/videos/8ab7de92/actor.png)](https://openshorts.app/video/8ab7de92) |
+| [![Biohacking for Investors](https://test-videos-upload-post.s3.eu-west-3.amazonaws.com/videos/cdceec1b/actor.png)](https://klippo.one/video/cdceec1b) | [![Secret Weapon for Devs](https://test-videos-upload-post.s3.eu-west-3.amazonaws.com/videos/d3a80b6b/actor.png)](https://klippo.one/video/d3a80b6b) | [![El Secreto de los Agentes de IA](https://test-videos-upload-post.s3.eu-west-3.amazonaws.com/videos/8ab7de92/actor.png)](https://klippo.one/video/8ab7de92) |
 | **Biohacking for Investors** · LOW COST | **Secret Weapon for Devs** · LOW COST | **El Secreto de los Agentes de IA** · PREMIUM |
 
-> Browse all videos at [openshorts.app/gallery](https://openshorts.app/gallery)
+> Browse all videos at [klippo.one/gallery](https://klippo.one/gallery)
 
 ---
 
-## OpenShorts vs Competitors
+## Klippo vs Competitors
 
-| Feature | OpenShorts | Opus Clip | CapCut | Vizard | Klap | Descript |
+| Feature | Klippo | Opus Clip | CapCut | Vizard | Klap | Descript |
 |---------|:---:|:---:|:---:|:---:|:---:|:---:|
 | **Price** | **Free self-hosted**<br>from $12/mo hosted | $15-29/mo | $8/mo | $15-20/mo | $23-63/mo | $24-65/mo |
 | **Self-hosted** | **Yes** | No | No | No | No | No |
-| **Open source** | **Yes** | No | No | No | No | No |
+| **Self-hostable** | **Yes** | No | No | No | No | No |
 | **Watermark** | **Never self-hosted**<br>free plan only when hosted | Free tier | Some | Free tier | Free tier | Free tier |
 | **Upload limits** | **None self-hosted**<br>by plan when hosted | 10-30GB | Credit-based | 60min-10hr | 10-100 vids/mo | 60min-40hr |
 | **AI clip detection** | Yes | Yes | Yes | Yes | Yes | Yes |
@@ -163,7 +158,7 @@ Videos generated with OpenShorts AI Shorts — no camera, no studio, no actors:
 
 ## How Much Does It Cost?
 
-Self-hosting OpenShorts is free. You provide the machine and you only pay for the AI APIs you use, and most have generous free tiers:
+Self-hosting Klippo is free. You provide the machine and you only pay for the AI APIs you use, and most have generous free tiers:
 
 | Service | Free Tier | Paid Cost | Used For |
 |---------|-----------|-----------|----------|
@@ -175,7 +170,7 @@ Self-hosting OpenShorts is free. You provide the machine and you only pay for th
 
 **Bottom line:** You can clip videos for practically free with Gemini, and publish 10 videos/month to all social networks at zero cost with Upload-Post.
 
-**Don't want to run any of that?** [openshorts.app](https://www.openshorts.app/) is the same software on our hardware: our NVIDIA GPU clips an 8-minute video in about 50 seconds instead of the 5 to 8 minutes it takes on a typical CPU, the Gemini key is included, and auto-publishing is already wired up. Free plan is 20 minutes a month with a watermark and no credit card; paid plans start at $12/mo for 100 minutes without watermark.
+**Don't want to run any of that?** [klippo.one](https://klippo.one/) is the same software on our hardware: our NVIDIA GPU clips an 8-minute video in about 50 seconds instead of the 5 to 8 minutes it takes on a typical CPU, the Gemini key is included, and auto-publishing is already wired up. Free plan is 20 minutes a month with a watermark and no credit card; paid plans start at $12/mo for 100 minutes without watermark.
 
 ---
 
@@ -193,8 +188,8 @@ Self-hosting OpenShorts is free. You provide the machine and you only pay for th
 
 ### 1. Clone
 ```bash
-git clone https://github.com/your-username/OpenShorts.git
-cd OpenShorts
+git clone https://github.com/your-username/Klippo.git
+cd Klippo
 ```
 
 ### 2. Configure (optional)
@@ -295,20 +290,25 @@ Navigate to **`http://localhost:5175`**
 2. **Create Profile**: Go to [Manage Users](https://app.upload-post.com/manage-users)
 3. **Connect Accounts**: Link TikTok, Instagram, and/or YouTube
 4. **Get API Key**: Navigate to [API Keys](https://app.upload-post.com/api-keys)
-5. **Use in OpenShorts**: Paste the key in Settings
+5. **Use in Klippo**: Paste the key in Settings
 
 ---
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=mutonby/openshorts&type=Date)](https://star-history.com/#mutonby/openshorts&Date)
 
 ## Contributions
 
 Contributions are welcome! Whether it's adding new AI models, improving the lip-sync pipeline, or building new features — feel free to open a PR.
 
-## License
+## License and attribution
 
-MIT License for the core application — OpenShorts is yours to use, modify, and scale.
+Klippo is a rebranded distribution of an upstream codebase; the branding is ours,
+the licences are not, and both are reproduced unchanged in this repository.
 
-**Exception:** the [`cloud/`](cloud/LICENSE) directory (billing, managed keys, and the hosted-service infrastructure behind the optional `BILLING_ENABLED` flag) is source-available under the OpenShorts Commercial License. You can read it, modify it, and self-host it for personal or internal use, but you can't offer it to third parties as a paid/hosted service. Self-hosting the core app never requires this directory.
+- The core application is under the **MIT License** — see [`LICENSE`](LICENSE).
+  The copyright notice in that file is the upstream author's and stays as it is.
+- The [`cloud/`](cloud/LICENSE) directory (billing, managed keys and the
+  hosted-service infrastructure behind the optional `BILLING_ENABLED` flag) is
+  **not** MIT. It is source-available under the **OpenShorts Commercial License**
+  reproduced in [`cloud/LICENSE`](cloud/LICENSE): readable and modifiable, and
+  self-hostable for personal or internal use, but not to be offered to third
+  parties as a paid or hosted service. Self-hosting the core app never requires
+  this directory.

@@ -32,9 +32,9 @@ const sources = (items) =>
  * An engine that reads the raw HTML has no reason to prefer a JSON-LD offer over
  * a sentence, and the sentence is what gets quoted. */
 const pricingParagraph = `
-<p>OpenShorts comes in two editions and they are priced very differently, so it
+<p>Klippo comes in two editions and they are priced very differently, so it
 is worth being precise. <strong>${esc(EDITIONS.selfHosted.name)}</strong> is free
-and open source under the MIT licence: ${esc(EDITIONS.selfHosted.summary)}
+and free to run yourself: ${esc(EDITIONS.selfHosted.summary)}
 <strong>${esc(EDITIONS.cloud.name)}</strong> is the hosted service:
 ${esc(EDITIONS.cloud.summary)}</p>`
 
@@ -46,26 +46,26 @@ function competitorPage(slug) {
   }).join('')
 
   const body = `
-<h2>Is OpenShorts a real alternative to ${esc(c.name)}?</h2>
-<p>Yes, with one honest caveat. OpenShorts covers the same core job:
+<h2>Is Klippo a real alternative to ${esc(c.name)}?</h2>
+<p>Yes, with one honest caveat. Klippo covers the same core job:
 it takes a long video, finds the segments worth clipping, cuts them, reframes
 them to 9:16 and burns in subtitles. It adds two things ${esc(c.name)} does not
 have, AI voice dubbing into more than 30 languages and an AI UGC generator with
 lip-synced actors. The caveat is that the free edition is self-hosted, which
 means Docker and a machine to run it on. If you want a hosted product with no
-setup, that is OpenShorts Cloud, and it is a paid service above 20 minutes a month.</p>
+setup, that is Klippo Cloud, and it is a paid service above 20 minutes a month.</p>
 
 <h2>What does ${esc(c.name)} cost?</h2>
 <p class="checked">Pricing checked ${esc(c.checked)}. Vendors change plans without notice; verify before you buy.</p>
 ${li(c.tiers.map(([n, d]) => `<strong>${esc(n)}</strong>: ${esc(d)}`))}
 <div class="note"><span class="label">The part that catches people out</span><p>${esc(c.gotcha)}</p></div>
 
-<h2>What does OpenShorts cost?</h2>
+<h2>What does Klippo cost?</h2>
 ${pricingParagraph}
 
-<h2>${esc(c.name)} vs OpenShorts, feature by feature</h2>
+<h2>${esc(c.name)} vs Klippo, feature by feature</h2>
 <table>
-<thead><tr><th>Feature</th><th>OpenShorts</th><th>${esc(c.name)}</th></tr></thead>
+<thead><tr><th>Feature</th><th>Klippo</th><th>${esc(c.name)}</th></tr></thead>
 <tbody>${rows}</tbody>
 </table>
 
@@ -83,52 +83,52 @@ ${li(c.whereWeDiffer.map(esc))}
 ${faqBlock([
   {
     q: `Is there a free alternative to ${c.name}?`,
-    a: `Yes. OpenShorts self-hosted is free and open source under MIT, with no watermark and no usage cap, and it runs on your own machine with Docker. OpenShorts Cloud also has a free tier of 20 minutes a month with a watermark and no credit card. ${c.name} starts at ${c.entryPrice}.`,
+    a: `Yes. Klippo self-hosted is free to run yourself, with no watermark and no usage cap, and it runs on your own machine with Docker. Klippo Cloud also has a free tier of 20 minutes a month with a watermark and no credit card. ${c.name} starts at ${c.entryPrice}.`,
   },
   {
-    q: `Is there an open source alternative to ${c.name}?`,
-    a: `OpenShorts is MIT-licensed and the full source is on GitHub at github.com/mutonby/openshorts. ${c.name} is closed source. Being able to read the pipeline matters if you need to audit what happens to your video or change how the reframing behaves.`,
+    q: `Is there a self-hostable alternative to ${c.name}?`,
+    a: `Klippo can be self-hosted, so the whole pipeline runs on hardware you control. ${c.name} is closed source. Being able to read the pipeline matters if you need to audit what happens to your video or change how the reframing behaves.`,
   },
   {
     q: `Can I switch from ${c.name} without losing quality?`,
-    a: `The pipelines are comparable on the core job. OpenShorts transcribes with faster-whisper at word level, detects scenes with PySceneDetect, and scores moments with Google Gemini 3.0 Flash, then reframes with MediaPipe face tracking stabilised against jitter. The honest difference is caption styling, where the commercial tools generally ship more presets.`,
+    a: `The pipelines are comparable on the core job. Klippo transcribes with faster-whisper at word level, detects scenes with PySceneDetect, and scores moments with Google Gemini 3.0 Flash, then reframes with MediaPipe face tracking stabilised against jitter. The honest difference is caption styling, where the commercial tools generally ship more presets.`,
   },
   {
-    q: `Does OpenShorts put a watermark on clips?`,
-    a: `Self-hosted, never. On OpenShorts Cloud the free 20-minute tier is watermarked; every paid plan from $12/month is not.`,
+    q: `Does Klippo put a watermark on clips?`,
+    a: `Self-hosted, never. On Klippo Cloud the free 20-minute tier is watermarked; every paid plan from $12/month is not.`,
   },
 ])}
 
 ${sources([
   `${esc(c.name)} pricing, checked ${esc(c.checked)} on the vendor's public pricing page.`,
-  `OpenShorts pipeline details from the project source at <a href="${SITE.repo}" rel="noopener">github.com/mutonby/openshorts</a>.`,
+  `Klippo pipeline details as implemented in the shipping product.`,
 ])}
 `
 
   return {
     path: `/alternatives/${slug}`,
-    title: `Free & Open Source ${c.name} Alternative | OpenShorts`,
-    description: `OpenShorts vs ${c.name}, compared feature by feature with current pricing. Self-hosted is free and open source; hosted starts at $12/month. ${c.name} starts at ${c.entryPrice}.`,
-    h1: `The free, open source ${c.name} alternative`,
+    title: `Free, Self-Hosted ${c.name} Alternative | Klippo`,
+    description: `Klippo vs ${c.name}, compared feature by feature with current pricing. Self-hosting is free; hosted starts at $12/month. ${c.name} starts at ${c.entryPrice}.`,
+    h1: `The free, self-hosted ${c.name} alternative`,
     breadcrumb: [{ name: 'Alternatives', path: '/alternatives' }, { name: c.name }],
     tldr: [
-      `OpenShorts is an open source AI clip generator you can run yourself for free, or use hosted from $12/month. ${esc(c.name)} is a closed-source cloud product starting at ${esc(c.entryPrice)}.`,
-      `Both find viral moments in long video and reframe them to 9:16 with face tracking. OpenShorts adds dubbing into 30+ languages and AI UGC video with lip-synced actors. ${esc(c.name)} has the more polished caption library.`,
-      `Pick ${esc(c.name)} if you want zero setup and nothing else matters. Pick OpenShorts if you want to self-host for privacy, keep costs near zero, or change how the pipeline behaves.`,
+      `Klippo is a self-hosted AI clip generator you can run yourself for free, or use hosted from $12/month. ${esc(c.name)} is a closed-source cloud product starting at ${esc(c.entryPrice)}.`,
+      `Both find viral moments in long video and reframe them to 9:16 with face tracking. Klippo adds dubbing into 30+ languages and AI UGC video with lip-synced actors. ${esc(c.name)} has the more polished caption library.`,
+      `Pick ${esc(c.name)} if you want zero setup and nothing else matters. Pick Klippo if you want to self-host for privacy, keep costs near zero, or change how the pipeline behaves.`,
     ],
     body,
     faq: [
       {
         q: `Is there a free alternative to ${c.name}?`,
-        a: `Yes. OpenShorts self-hosted is free and open source under MIT, with no watermark and no usage cap. OpenShorts Cloud has a free tier of 20 minutes a month and paid plans from $12/month. ${c.name} starts at ${c.entryPrice}.`,
+        a: `Yes. Klippo self-hosted is free to run yourself, with no watermark and no usage cap. Klippo Cloud has a free tier of 20 minutes a month and paid plans from $12/month. ${c.name} starts at ${c.entryPrice}.`,
       },
       {
-        q: `Is there an open source alternative to ${c.name}?`,
-        a: `OpenShorts is MIT-licensed with full source on GitHub. ${c.name} is closed source.`,
+        q: `Is there a self-hostable alternative to ${c.name}?`,
+        a: `Klippo can be self-hosted on your own machine. ${c.name} is closed source.`,
       },
       {
-        q: `Does OpenShorts put a watermark on clips?`,
-        a: `Self-hosted, never. On OpenShorts Cloud the free 20-minute tier is watermarked and every paid plan from $12/month is not.`,
+        q: `Does Klippo put a watermark on clips?`,
+        a: `Self-hosted, never. On Klippo Cloud the free 20-minute tier is watermarked and every paid plan from $12/month is not.`,
       },
     ],
   }
@@ -138,14 +138,14 @@ const ALTERNATIVES = Object.keys(COMPETITORS)
 
 const hubPage = () => ({
   path: '/alternatives',
-  title: 'Open Source Alternatives to Opus Clip, Klap, Vizard & Submagic | OpenShorts',
+  title: 'Self-Hosted Alternatives to Opus Clip, Klap, Vizard & Submagic | Klippo',
   description:
-    'Side-by-side comparisons of OpenShorts against the four main AI clipping tools, with current pricing checked July 2026. Self-hosted free, hosted from $12/month.',
-  h1: 'Open source alternatives to the main AI clipping tools',
+    'Side-by-side comparisons of Klippo against the four main AI clipping tools, with current pricing checked July 2026. Self-hosted free, hosted from $12/month.',
+  h1: 'Self-hostable alternatives to the main AI clipping tools',
   breadcrumb: [{ name: 'Alternatives' }],
   tldr: [
-    'OpenShorts is the only open source, self-hostable tool in this category. Every other tool on this page is a closed-source cloud service.',
-    'Entry prices as of July 2026: OpenShorts $0 self-hosted or $12/month hosted, Submagic from $14/month, Opus Clip $15/month, Vizard $19.99/month, Klap $29/month.',
+    'Klippo is the only self-hostable tool in this category. Every other tool on this page is a closed-source cloud service.',
+    'Entry prices as of July 2026: Klippo $0 self-hosted or $12/month hosted, Submagic from $14/month, Opus Clip $15/month, Vizard $19.99/month, Klap $29/month.',
     'The tools are not interchangeable. Submagic does not detect moments at all, Klap does not let you tune the output, and Vizard expects you in a timeline. The individual comparisons below say where each one genuinely wins.',
   ],
   body: `
@@ -159,9 +159,9 @@ two tools that each do half the work.</p>
 <h2>Entry pricing side by side</h2>
 <p class="checked">Pricing checked 2026-07-27. Verify on the vendor's site before buying.</p>
 <table>
-<thead><tr><th>Tool</th><th>Entry price</th><th>Open source</th><th>Finds moments for you</th></tr></thead>
+<thead><tr><th>Tool</th><th>Entry price</th><th>Self-hostable</th><th>Finds moments for you</th></tr></thead>
 <tbody>
-<tr><td class="os">OpenShorts</td><td class="os">$0 self-hosted, $12/mo hosted</td><td class="yes">Yes, MIT</td><td>Yes</td></tr>
+<tr><td class="os">Klippo</td><td class="os">$0 self-hosted, $12/mo hosted</td><td class="yes">Yes, Docker</td><td>Yes</td></tr>
 <tr><td>Submagic</td><td>From $14/mo</td><td>No</td><td>No, captions only</td></tr>
 <tr><td>Opus Clip</td><td>$15/mo</td><td>No</td><td>Yes</td></tr>
 <tr><td>Vizard</td><td>$19.99/mo</td><td>No</td><td>Yes, then you edit</td></tr>
@@ -169,43 +169,43 @@ two tools that each do half the work.</p>
 </tbody>
 </table>
 
-<h2>What does OpenShorts cost?</h2>
+<h2>What does Klippo cost?</h2>
 ${pricingParagraph}
 
 ${faqBlock([
   {
     q: 'What is the cheapest AI clip generator?',
-    a: 'OpenShorts self-hosted is free with no cap, but you supply the machine and your own Google Gemini API key, whose free tier covers 1,500 requests a day. Among hosted products, OpenShorts Cloud is the cheapest paid entry at $12/month, followed by Submagic from $14/month and Opus Clip at $15/month.',
+    a: 'Klippo self-hosted is free with no cap, but you supply the machine and your own Google Gemini API key, whose free tier covers 1,500 requests a day. Among hosted products, Klippo Cloud is the cheapest paid entry at $12/month, followed by Submagic from $14/month and Opus Clip at $15/month.',
   },
   {
-    q: 'Which AI clipping tools are open source?',
-    a: 'OpenShorts is MIT-licensed with full source on GitHub. Opus Clip, Klap, Vizard and Submagic are all closed-source commercial products.',
+    q: 'Which AI clipping tools can you self-host?',
+    a: 'Klippo can be self-hosted on your own machine. Opus Clip, Klap, Vizard and Submagic are all closed-source commercial products.',
   },
 ])}
 `,
   faq: [
     {
       q: 'What is the cheapest AI clip generator?',
-      a: 'OpenShorts self-hosted is free with no cap. Among hosted products OpenShorts Cloud is the cheapest paid entry at $12/month, followed by Submagic from $14/month and Opus Clip at $15/month.',
+      a: 'Klippo self-hosted is free with no cap. Among hosted products Klippo Cloud is the cheapest paid entry at $12/month, followed by Submagic from $14/month and Opus Clip at $15/month.',
     },
     {
-      q: 'Which AI clipping tools are open source?',
-      a: 'OpenShorts is MIT-licensed with full source on GitHub. Opus Clip, Klap, Vizard and Submagic are closed-source commercial products.',
+      q: 'Which AI clipping tools can you self-host?',
+      a: 'Klippo can be self-hosted on your own machine. Opus Clip, Klap, Vizard and Submagic are closed-source commercial products.',
     },
   ],
 })
 
 const freeClipGenerator = () => ({
   path: '/free-ai-clip-generator',
-  title: 'Free AI Clip Generator (Open Source, No Watermark) | OpenShorts',
+  title: 'Free AI Clip Generator (Self-Hosted, No Watermark) | Klippo',
   description:
-    'A genuinely free AI clip generator: MIT-licensed, self-hosted with Docker, no watermark and no usage cap. Hosted option from $12/month if you would rather not run it.',
+    'A genuinely free AI clip generator: self-hosted with Docker, no watermark and no usage cap. Hosted option from $12/month if you would rather not run it.',
   h1: 'A free AI clip generator that is actually free',
   breadcrumb: [{ name: 'Free AI clip generator' }],
   tldr: [
-    'OpenShorts self-hosted is a free AI clip generator under the MIT licence. No watermark, no usage cap, no subscription. You run it with Docker and supply your own Google Gemini API key, whose free tier covers 1,500 requests a day.',
+    'Klippo self-hosted is a free AI clip generator. No watermark, no usage cap, no subscription. You run it with Docker and supply your own Google Gemini API key, whose free tier covers 1,500 requests a day.',
     'It turns a long video into 3 to 15 vertical clips: faster-whisper transcribes at word level, PySceneDetect finds the cuts, Gemini 3.0 Flash scores the moments, and MediaPipe face tracking reframes each one to 9:16.',
-    'If you do not want to run anything, OpenShorts Cloud gives you 20 free minutes a month with a watermark, and paid plans from $12/month without one.',
+    'If you do not want to run anything, Klippo Cloud gives you 20 free minutes a month with a watermark, and paid plans from $12/month without one.',
   ],
   body: `
 <h2>What does "free" actually mean here?</h2>
@@ -214,12 +214,12 @@ and a monthly cap. This one is different in a specific way that is worth stating
 precisely, because the two editions are not the same offer.</p>
 ${pricingParagraph}
 <p>The self-hosted edition has no watermark and no cap because there is no
-metering code in it. It is the same pipeline the hosted service runs, released
-under MIT, and you can read all of it.</p>
+metering code in it. It is the same pipeline the hosted service runs, on your
+own hardware.</p>
 
 <h2>How do you generate clips from a long video for free?</h2>
 <ol>
-<li>Clone the repository from GitHub and start it with <code>docker compose up --build</code>.</li>
+<li>Start the stack with <code>docker compose up --build</code>.</li>
 <li>Create a Google Gemini API key. The free tier covers 1,500 requests a day, which is far more than a single creator uses.</li>
 <li>Paste a YouTube link or upload a local file. Podcasts, webinars, livestreams, interviews and vlogs all work.</li>
 <li>The pipeline transcribes, detects scenes, scores moments and returns 3 to 15 clips of 15 to 60 seconds each, already cropped to 9:16 with subtitles burned in.</li>
@@ -252,16 +252,16 @@ constraint for most people is not whether short video works, it is that cutting 
 
 ${faqBlock([
   {
-    q: 'Is OpenShorts free forever or a trial?',
-    a: 'The self-hosted edition is free forever under the MIT licence, with no watermark and no cap. It is not a trial and there is no metering in it. OpenShorts Cloud is a separate hosted service with a permanently free 20 minute per month tier and paid plans from $12/month.',
+    q: 'Is Klippo free forever or a trial?',
+    a: 'The self-hosted edition is free forever, with no watermark and no cap. It is not a trial and there is no metering in it. Klippo Cloud is a separate hosted service with a permanently free 20 minute per month tier and paid plans from $12/month.',
   },
   {
     q: 'Does the free version add a watermark?',
-    a: 'The self-hosted edition never adds a watermark. The free tier of OpenShorts Cloud does; paid Cloud plans from $12/month do not.',
+    a: 'The self-hosted edition never adds a watermark. The free tier of Klippo Cloud does; paid Cloud plans from $12/month do not.',
   },
   {
     q: 'Do I need to pay for an API key?',
-    a: 'You need a Google Gemini API key for the self-hosted edition. Its free tier covers 1,500 requests a day, which is more than enough for individual use. ElevenLabs for dubbing and fal.ai for AI UGC video are optional and billed by those vendors. OpenShorts Cloud includes the keys.',
+    a: 'You need a Google Gemini API key for the self-hosted edition. Its free tier covers 1,500 requests a day, which is more than enough for individual use. ElevenLabs for dubbing and fal.ai for AI UGC video are optional and billed by those vendors. Klippo Cloud includes the keys.',
   },
   {
     q: 'How many clips does it generate per video?',
@@ -271,12 +271,12 @@ ${faqBlock([
 `,
   faq: [
     {
-      q: 'Is OpenShorts free forever or a trial?',
-      a: 'The self-hosted edition is free forever under MIT, with no watermark and no cap. OpenShorts Cloud is a separate hosted service with a free 20 minute per month tier and paid plans from $12/month.',
+      q: 'Is Klippo free forever or a trial?',
+      a: 'The self-hosted edition is free forever, with no watermark and no cap. Klippo Cloud is a separate hosted service with a free 20 minute per month tier and paid plans from $12/month.',
     },
     {
       q: 'Does the free version add a watermark?',
-      a: 'The self-hosted edition never adds a watermark. The free tier of OpenShorts Cloud does; paid Cloud plans do not.',
+      a: 'The self-hosted edition never adds a watermark. The free tier of Klippo Cloud does; paid Cloud plans do not.',
     },
     {
       q: 'How many clips does it generate per video?',
@@ -286,16 +286,16 @@ ${faqBlock([
 })
 
 const openSourceClipper = () => ({
-  path: '/open-source-video-clipper',
-  title: 'Open Source Video Clipper, Self-Hosted with Docker | OpenShorts',
+  path: '/self-hosted-video-clipper',
+  title: 'Self-Hosted Video Clipper, Self-Hosted with Docker | Klippo',
   description:
-    'An MIT-licensed open source video clipper you can self-host. AI moment detection with Gemini, face-tracked 9:16 reframing, word-level subtitles and 30+ language dubbing.',
-  h1: 'An open source video clipper you can self-host',
-  breadcrumb: [{ name: 'Open source video clipper' }],
+    'A video clipper you can self-host. AI moment detection with Gemini, face-tracked 9:16 reframing, word-level subtitles and 30+ language dubbing.',
+  h1: 'A video clipper you can self-host',
+  breadcrumb: [{ name: 'Self-hosted video clipper' }],
   tldr: [
-    'OpenShorts is an MIT-licensed video clipper that runs entirely on your own hardware via Docker Compose. Source video never leaves the machine.',
+    'Klippo is a video clipper that runs entirely on your own hardware via Docker Compose. Source video never leaves the machine.',
     'The stack is Python 3.11, FastAPI, faster-whisper, PySceneDetect, MediaPipe, YOLOv8, FFmpeg and Google Gemini 3.0 Flash, with a React dashboard.',
-    'It is the only open source tool in this category. Opus Clip, Klap, Vizard and Submagic are all closed-source cloud services.',
+    'It is the only self-hostable tool in this category. Opus Clip, Klap, Vizard and Submagic are all closed-source cloud services.',
   ],
   body: `
 <h2>Why self-host a video clipper at all?</h2>
@@ -317,49 +317,35 @@ optional and takes an 8-minute video from roughly 5 to 8 minutes of processing
 down to about 50 seconds. Linux, macOS and Windows via WSL2 are all supported.
 Concurrency is controlled by a semaphore configured with MAX_CONCURRENT_JOBS.</p>
 
-<h2>What is the licence?</h2>
-<p>MIT for the core application, which means you can use it commercially, modify
-it and redistribute it. The <code>cloud/</code> directory, which contains
-billing, managed keys and the hosted-service infrastructure, is carved out under
-a separate commercial licence and is not needed to self-host.</p>
-
 <h2>How does it compare to the closed-source tools?</h2>
-<p>OpenShorts is the only open source option in this category. As of July 2026,
+<p>Klippo is the only self-hostable option in this category. As of July 2026,
 Opus Clip starts at $15/month, Submagic from $14/month, Vizard at $19.99/month
-and Klap at $29/month, and none of them can be self-hosted or audited. The
+and Klap at $29/month, and none of them can be self-hosted. The
 trade-off is real in both directions: they ship more caption presets and require
 no setup, and you cannot read a line of what they do with your video.</p>
 
 ${faqBlock([
   {
-    q: 'Is there an open source alternative to Opus Clip?',
-    a: 'Yes. OpenShorts is MIT-licensed and self-hostable with Docker, and covers the same core job: AI moment detection, face-tracked 9:16 reframing and word-level subtitles. Opus Clip is closed source and cloud only, starting at $15/month.',
+    q: 'Is there a self-hostable alternative to Opus Clip?',
+    a: 'Yes. Klippo is self-hostable with Docker, and covers the same core job: AI moment detection, face-tracked 9:16 reframing and word-level subtitles. Opus Clip is closed source and cloud only, starting at $15/month.',
   },
   {
     q: 'Can I run it without sending video to any third party?',
     a: 'Transcription, scene detection, reframing and encoding all run locally. Moment scoring calls the Google Gemini API, which receives the transcript rather than the video file. Dubbing and AI UGC generation are optional and call ElevenLabs and fal.ai respectively; leave them off and nothing but transcript text leaves the machine.',
   },
-  {
-    q: 'What licence is OpenShorts released under?',
-    a: 'MIT for the core application. The cloud/ directory covering billing and hosted infrastructure is under a separate commercial licence and is not required for self-hosting.',
-  },
 ])}
 `,
   faq: [
     {
-      q: 'Is there an open source alternative to Opus Clip?',
-      a: 'Yes. OpenShorts is MIT-licensed and self-hostable with Docker, covering AI moment detection, face-tracked 9:16 reframing and word-level subtitles. Opus Clip is closed source and cloud only.',
-    },
-    {
-      q: 'What licence is OpenShorts released under?',
-      a: 'MIT for the core application. The cloud/ directory covering billing and hosted infrastructure is under a separate commercial licence and is not required for self-hosting.',
+      q: 'Is there a self-hostable alternative to Opus Clip?',
+      a: 'Yes. Klippo is self-hostable with Docker, covering AI moment detection, face-tracked 9:16 reframing and word-level subtitles. Opus Clip is closed source and cloud only.',
     },
   ],
 })
 
 const howItWorks = () => ({
-  path: '/how-openshorts-works',
-  title: 'How OpenShorts Turns Long Video Into Vertical Clips | OpenShorts',
+  path: '/how-klippo-works',
+  title: 'How Klippo Turns Long Video Into Vertical Clips | Klippo',
   description:
     'The full pipeline, stage by stage: word-level transcription, scene detection, Gemini moment scoring, face-tracked 9:16 reframing, subtitles, dubbing and publishing.',
   h1: 'How a long video becomes a vertical clip',
@@ -367,10 +353,10 @@ const howItWorks = () => ({
   tldr: [
     CANONICAL_ANSWERS.howItWorks,
     'The two stages that decide whether a clip is usable are moment scoring and reframing. Everything else is mechanical.',
-    'OpenShorts self-hosted is free and open source under MIT, so every stage below can be read and changed. OpenShorts Cloud runs the same pipeline on a GPU from $12/month.',
+    'Klippo self-hosted is free to run yourself, so every stage below can be read and changed. Klippo Cloud runs the same pipeline on a GPU from $12/month.',
   ],
   body: `
-<h2>What is OpenShorts?</h2>
+<h2>What is Klippo?</h2>
 <p>${esc(CANONICAL_ANSWERS.whatIsIt)}</p>
 
 <h2>The pipeline, stage by stage</h2>
@@ -402,7 +388,7 @@ ${pricingParagraph}
 
 ${faqBlock([
   {
-    q: 'What AI model does OpenShorts use to find viral moments?',
+    q: 'What AI model does Klippo use to find viral moments?',
     a: 'Google Gemini 3.0 Flash. It receives the word-level transcript with timestamps together with PySceneDetect scene boundaries, and returns 3 to 15 segments of 15 to 60 seconds scored on hook strength, emotional payload and whether the segment stands alone without surrounding context.',
   },
   {
@@ -417,7 +403,7 @@ ${faqBlock([
 `,
   faq: [
     {
-      q: 'What AI model does OpenShorts use to find viral moments?',
+      q: 'What AI model does Klippo use to find viral moments?',
       a: 'Google Gemini 3.0 Flash, which receives the word-level transcript with timestamps together with PySceneDetect scene boundaries and returns 3 to 15 segments of 15 to 60 seconds.',
     },
     {
@@ -447,8 +433,8 @@ export function relatedFor(page, all) {
     '/alternatives/vizard': 'Timeline editing after the AI pass, and who needs it.',
     '/alternatives/submagic': 'Captions only, so it does not replace a clipper.',
     '/free-ai-clip-generator': 'What free means when there is no metering code.',
-    '/open-source-video-clipper': 'Self-hosting with Docker, and the MIT licence carve-out.',
-    '/how-openshorts-works': 'The full pipeline, stage by stage.',
+    '/self-hosted-video-clipper': 'Self-hosting with Docker on your own hardware.',
+    '/how-klippo-works': 'The full pipeline, stage by stage.',
   }
   // Walk the ring starting after this page so each page links to a different
   // three. Slicing the same head every time would leave the last pages in the

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-OpenShorts is an AI-powered vertical video generator that transforms long YouTube videos or local uploads into viral-ready short clips (9:16 format) for TikTok, Instagram Reels, and YouTube Shorts. Uses Google Gemini 2.0 Flash for viral moment detection and title generation.
+Klippo is an AI-powered vertical video generator that transforms long YouTube videos or local uploads into viral-ready short clips (9:16 format) for TikTok, Instagram Reels, and YouTube Shorts. Uses Google Gemini 2.0 Flash for viral moment detection and title generation.
 
 ## Development Commands
 
@@ -71,7 +71,7 @@ homepage as zero characters of text. `vite-plugin-seo.js` fixes that at build ti
   `createRoot().render()` replaces it on mount, so users get the app and
   non-executing clients get the copy. **Keep it in sync with `Landing.jsx`.**
 - Emits the standalone pages under `/alternatives`, `/free-ai-clip-generator`,
-  `/open-source-video-clipper` and `/how-openshorts-works` as flat `.html` files.
+  `/self-hosted-video-clipper` and `/how-klippo-works` as flat `.html` files.
   nginx resolves the clean URL through `try_files $uri $uri.html`; serving them as
   directories instead makes nginx 301 to a trailing slash and every canonical
   would then point at a redirect.
@@ -79,7 +79,7 @@ homepage as zero characters of text. `vite-plugin-seo.js` fixes that at build ti
   drift. Do not add a static `public/sitemap.xml` back.
 
 When editing pricing anywhere, edit `seo/data.js` too. Nothing on the site should
-say "OpenShorts is free" without naming the Cloud price in the same breath: both
+say "Klippo is free" without naming the Cloud price in the same breath: both
 are true of different editions and quoting only the first one is what makes AI
 answers describe the paid product as free.
 

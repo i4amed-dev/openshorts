@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Klippo">
+  <title>Klippo</title>
+  <rect width="64" height="64" rx="14" fill="#219ebc"/>
+  <path d="M24 19 L24 45 M24 32 L39 19 M24 32 L39 45" fill="none" stroke="#0b1f27"
+        stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -61,21 +61,21 @@ const STEPS = [
 
 const FAQ = [
   [
-    'Is OpenShorts free? What is the catch?',
+    'Is Klippo free? What is the catch?',
     CANONICAL_ANSWERS.isItFree +
-      ' Self-hosted costs you hardware and time: on a typical CPU an 8-minute video takes 5 to 8 minutes to process, and you supply your own Google Gemini key, whose free tier covers 1,500 requests a day. On OpenShorts Cloud an NVIDIA GPU clips that same video in about 50 seconds, the Gemini key is included, auto-posting to TikTok, Instagram and YouTube is already wired up, and your clips stay retrievable from any browser.',
+      ' Self-hosted costs you hardware and time: on a typical CPU an 8-minute video takes 5 to 8 minutes to process, and you supply your own Google Gemini key, whose free tier covers 1,500 requests a day. On Klippo Cloud an NVIDIA GPU clips that same video in about 50 seconds, the Gemini key is included, auto-posting to TikTok, Instagram and YouTube is already wired up, and your clips stay retrievable from any browser.',
   ],
-  ['What is OpenShorts and how does it work?', CANONICAL_ANSWERS.whatIsIt + ' ' + CANONICAL_ANSWERS.howItWorks],
+  ['What is Klippo and how does it work?', CANONICAL_ANSWERS.whatIsIt + ' ' + CANONICAL_ANSWERS.howItWorks],
   [
-    'How does OpenShorts compare to Opus Clip?',
-    'Both do AI viral moment detection and smart vertical cropping. OpenShorts is MIT-licensed and can be self-hosted, so the source video never leaves your machine, and it adds voice dubbing into 30+ languages plus an AI UGC generator with lip-synced actors. Opus Clip is closed source and cloud only, starting at $15/month as of July 2026, and it ships a larger caption-style library. Full comparison at /alternatives/opus-clip.',
+    'How does Klippo compare to Opus Clip?',
+    'Both do AI viral moment detection and smart vertical cropping. Klippo can be self-hosted, so the source video never leaves your machine, and it adds voice dubbing into 30+ languages plus an AI UGC generator with lip-synced actors. Opus Clip is closed source and cloud only, starting at $15/month as of July 2026, and it ships a larger caption-style library. Full comparison at /alternatives/opus-clip.',
   ],
   [
     'How does the smart vertical cropping work?',
     'TRACK mode follows a single subject with MediaPipe face detection and a YOLOv8 fallback, damped so the crop holds still inside a safe zone rather than chasing every head movement. GENERAL mode handles group shots and landscapes by preserving the full width over a blurred backdrop. A speaker tracker prevents the crop from flipping between people and holds position through brief occlusions.',
   ],
   [
-    'Can OpenShorts translate and dub videos?',
+    'Can Klippo translate and dub videos?',
     'Yes, into more than 30 languages through ElevenLabs, preserving the original speaker\'s voice characteristics. After dubbing, the audio is re-transcribed so the burned-in subtitles are in the target language rather than the original.',
   ],
   [
@@ -95,13 +95,13 @@ export const LANDING_FALLBACK = `<div id="seo-content" style="background:oklch(1
 
 <section style="${S.section};padding-top:4rem"><div style="${S.wrap}">
   <p style="${S.eyebrow}">AI clip generator &middot; cloud or self-hosted</p>
-  <h1 style="${S.h1}">the free open source ai clip generator, built to clip what people actually watch.</h1>
+  <h1 style="${S.h1}">the self-hosted ai clip generator, built to clip what people actually watch.</h1>
   <p style="${S.p};max-width:44rem;font-size:1.05rem">Turn long videos into viral 9:16 shorts, or generate UGC marketing videos with AI actors. Online in the cloud with zero setup, or self-hosted with Docker for free.</p>
-  <p style="${S.muted};max-width:44rem"><strong style="color:oklch(75% 0.11 150)">No credit card required.</strong> 20 free minutes every month. Paid plans from $12/month without a watermark. Prefer to run it yourself? <a style="${S.a}" href="https://github.com/mutonby/openshorts" rel="noopener">Self-host free on GitHub</a>.</p>
+  <p style="${S.muted};max-width:44rem"><strong style="color:oklch(75% 0.11 150)">No credit card required.</strong> 20 free minutes every month. Paid plans from $12/month without a watermark. Prefer to run it yourself? Self-hosting with Docker is free.</p>
 </div></section>
 
 <section style="${S.section}"><div style="${S.wrap}">
-  <h2 style="${S.h2}">what openshorts is</h2>
+  <h2 style="${S.h2}">what klippo is</h2>
   <p style="${S.p};max-width:48rem">${CANONICAL_ANSWERS.whatIsIt}</p>
   <p style="${S.p};max-width:48rem">${CANONICAL_ANSWERS.howItWorks}</p>
 </div></section>
@@ -109,8 +109,8 @@ export const LANDING_FALLBACK = `<div id="seo-content" style="background:oklch(1
 <section style="${S.section}"><div style="${S.wrap}">
   <h2 style="${S.h2}">what it costs</h2>
   <div style="${S.grid};max-width:56rem">
-    ${card('OpenShorts self-hosted &middot; $0', EDITIONS.selfHosted.summary)}
-    ${card('OpenShorts Cloud &middot; free tier, then from $12/month', EDITIONS.cloud.summary)}
+    ${card('Klippo self-hosted &middot; $0', EDITIONS.selfHosted.summary)}
+    ${card('Klippo Cloud &middot; free tier, then from $12/month', EDITIONS.cloud.summary)}
   </div>
 </div></section>
 
@@ -128,15 +128,15 @@ export const LANDING_FALLBACK = `<div id="seo-content" style="background:oklch(1
 
 <section style="${S.section}"><div style="${S.wrap}">
   <h2 style="${S.h2}">how it compares</h2>
-  <p style="${S.muted};max-width:48rem">Entry pricing checked 27 July 2026. OpenShorts is $0 self-hosted or $12/month hosted without a watermark. Submagic starts at $14/month, Opus Clip at $15/month, Vizard at $19.99/month and Klap at $29/month. OpenShorts is the only open source and self-hostable option of the five.</p>
+  <p style="${S.muted};max-width:48rem">Entry pricing checked 27 July 2026. Klippo is $0 self-hosted or $12/month hosted without a watermark. Submagic starts at $14/month, Opus Clip at $15/month, Vizard at $19.99/month and Klap at $29/month. Klippo is the only self-hostable option of the five.</p>
   <p style="${S.muted}">
     <a style="${S.a}" href="/alternatives/opus-clip">Opus Clip alternative</a> &middot;
     <a style="${S.a}" href="/alternatives/klap">Klap alternative</a> &middot;
     <a style="${S.a}" href="/alternatives/vizard">Vizard alternative</a> &middot;
     <a style="${S.a}" href="/alternatives/submagic">Submagic alternative</a> &middot;
     <a style="${S.a}" href="/free-ai-clip-generator">Free AI clip generator</a> &middot;
-    <a style="${S.a}" href="/open-source-video-clipper">Open source video clipper</a> &middot;
-    <a style="${S.a}" href="/how-openshorts-works">How it works</a>
+    <a style="${S.a}" href="/self-hosted-video-clipper">Self-hosted video clipper</a> &middot;
+    <a style="${S.a}" href="/how-klippo-works">How it works</a>
   </p>
 </div></section>
 

@@ -82,10 +82,13 @@
     background: var(--color-accent);
     color: var(--color-accent-ink);
     border-radius: 999px;
-    transition: filter var(--dur-short) var(--ease-out), transform var(--dur-short) var(--ease-out);
+    transition: background var(--dur-short) var(--ease-out), transform var(--dur-short) var(--ease-out);
   }
-  .btn-primary:hover { filter: brightness(1.08); }
-  .btn-primary:active { transform: translateY(1px); }
+  /* Explicit state tokens rather than brightness(): brightening a mid-lightness
+     blue washes it toward cyan, where the previous near-white orange only got
+     paler. Stepping lightness down keeps the hue and raises label contrast. */
+  .btn-primary:hover { background: var(--color-accent-hover); }
+  .btn-primary:active { background: var(--color-accent-active); transform: translateY(1px); }
   .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; }
 
   .btn-ghost {

@@ -48,17 +48,14 @@ async def send_magic_link_email(email: str, link: str):
         return
     html = f"""
       <div style="font-family:system-ui,sans-serif;max-width:480px;margin:0 auto">
-        <h2>Sign in to OpenShorts</h2>
+        <h2>Sign in to Klippo</h2>
         <p>Click the button below to sign in. This link expires in 15 minutes.</p>
         <p><a href="{link}" style="display:inline-block;background:#111;color:#fff;
            padding:12px 20px;border-radius:8px;text-decoration:none">Sign in</a></p>
         <p style="color:#666;font-size:13px">If you didn't request this, ignore this email.</p>
       </div>
     """
-    await send_email(email, "Your OpenShorts sign-in link", html)
-
-
-GITHUB_REPO_URL = "https://github.com/mutonby/openshorts"
+    await send_email(email, "Your Klippo sign-in link", html)
 
 
 async def send_clips_ready_email(email: str, job_title: str, clip_count: int,
@@ -72,8 +69,6 @@ async def send_clips_ready_email(email: str, job_title: str, clip_count: int,
            clip{'s' if clip_count != 1 else ''}. They're waiting in your dashboard.</p>
         <p><a href="{dashboard_url}" style="display:inline-block;background:#111;color:#fff;
            padding:12px 20px;border-radius:8px;text-decoration:none">View my clips</a></p>
-        <p style="color:#666;font-size:13px">Enjoying OpenShorts? A
-           <a href="{GITHUB_REPO_URL}" style="color:#666">star on GitHub</a> helps a lot ⭐</p>
       </div>
     """
     await send_email(email, f"Your clips are ready — {title}", html)

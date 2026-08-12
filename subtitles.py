@@ -2,6 +2,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 from ffmpeg_utils import video_encode_args, QUALITY, METADATA_SCRUB
 
@@ -31,6 +32,28 @@ WHISPER_TRANSCRIBE_PARAMS = {
     "condition_on_previous_text": False,
     "word_timestamps": True,
 }
+
+
+# --- Burn geometry -------------------------------------------------------
+# Both burn paths render into a virtual frame 288 units tall: generate_ass
+# writes "PlayResY: 288", and FFmpeg's own SRT->ASS conversion defaults to the
+# same. libass then scales that frame to the real video, so a caption's height
+# on screen is  fontsize * ASS_FONT_SCALE * (video_height / ASS_PLAY_RES_Y)  —
+# 5.67x the requested size on a 1920-tall clip.
+#
+# The subtitle modal's live preview MUST apply the same factor, or it shows the
+# user a caption 2.5x smaller than the one that gets burned (reported 28-jul-2026).
+# Its copy of these numbers is in dashboard/src/components/SubtitleModal.jsx;
+# change them here and there together.
+ASS_PLAY_RES_Y = 288
+ASS_FONT_SCALE = 0.85
+
+# How words are grouped into caption blocks. The preview groups with the same
+# two numbers (groupCaptionsIntoBlocks in dashboard/src/remotion/lib/captions.ts),
+# so preview and burn break lines at the same places.
+CAPTION_MAX_CHARS = 20
+CAPTION_MAX_DURATION = 2.0
+
 
 
 def merge_continuation_words(words):
@@ -110,7 +133,9 @@ def transcribe_audio(video_path):
     return transcript
 
 
-def generate_srt_from_video(video_path, output_path, max_chars=20, max_duration=2.0,
+def generate_srt_from_video(video_path, output_path,
+                            max_chars=CAPTION_MAX_CHARS,
+                            max_duration=CAPTION_MAX_DURATION,
                             style="classic", **style_opts):
     """
     Transcribe a video and generate a subtitle file directly (SRT, or karaoke
@@ -131,7 +156,9 @@ def generate_srt_from_video(video_path, output_path, max_chars=20, max_duration=
     return generate_srt(transcript, 0, duration, output_path, max_chars, max_duration)
 
 
-def _collect_word_blocks(transcript, clip_start, clip_end, max_chars=20, max_duration=2.0):
+def _collect_word_blocks(transcript, clip_start, clip_end,
+                         max_chars=CAPTION_MAX_CHARS,
+                         max_duration=CAPTION_MAX_DURATION):
     """
     Flatten transcript words for a clip range and group them into short blocks
     suitable for vertical video. Returns a list of blocks; each block is a list
@@ -183,7 +210,8 @@ def _collect_word_blocks(transcript, clip_start, clip_end, max_chars=20, max_dur
     return blocks
 
 
-def generate_srt(transcript, clip_start, clip_end, output_path, max_chars=20, max_duration=2.0):
+def generate_srt(transcript, clip_start, clip_end, output_path,
+                 max_chars=CAPTION_MAX_CHARS, max_duration=CAPTION_MAX_DURATION):
     """
     Generates an SRT file from the transcript for a specific time range.
     Groups words into short lines suitable for vertical video.
@@ -212,13 +240,17 @@ def generate_srt(transcript, clip_start, clip_end, output_path, max_chars=20, ma
 SAFE_MARGIN_V = 43
 
 
-# The caption look applied automatically to every generated clip. Chosen by
-# rendering four candidates on a real clip and comparing them (25-jul-2026):
-# white Anton uppercase with a yellow active word, heavy black outline, gentle
-# pop. Yellow because it is the one colour that almost never occurs in footage,
-# so the active word reads instantly on any background; the base text stays
-# fully opaque (dimming it tested worse over bright scenes). This is a starting
-# point, not a cage — the subtitle modal still overrides every field.
+# Fallback caption look, and the base every partial style is merged onto (it is
+# what supplies max_chars/max_duration, which the modal doesn't expose). Clips
+# are NOT captioned with it automatically — the user picks the look in the
+# subtitle modal; this is only what a re-burn falls back to when the clip has
+# burned captions but no recorded style (clips captioned before the style was
+# persisted). Chosen by rendering four candidates on a real clip and comparing
+# them (25-jul-2026): white Anton uppercase with a yellow active word, heavy
+# black outline, gentle pop. Yellow because it is the one colour that almost
+# never occurs in footage, so the active word reads instantly on any
+# background; the base text stays fully opaque (dimming it tested worse over
+# bright scenes).
 AUTO_CAPTION_STYLE = {
     "style": "karaoke",
     "alignment": "bottom",
@@ -234,6 +266,84 @@ AUTO_CAPTION_STYLE = {
     "max_chars": 16,
     "max_duration": 1.4,
 }
+
+
+def caption_clip(clip_path, transcript, clip_start, clip_end, style=None):
+    """Burn one caption layer onto a finished clip, in the given style.
+
+    Clips do NOT get captions at generation time: burning a fixed house style
+    onto every clip meant every delivered clip carried captions nobody chose,
+    and the only way out was to restyle or remove them afterwards. Captions are
+    applied when the user asks for them, in the style they picked in the
+    subtitle modal (/api/subtitle).
+
+    This helper is what puts those captions BACK after an edit or a hook — both
+    derive from the clean file so a later restyle can't stack a second caption
+    layer — so ``style`` is the style the user chose for this clip, persisted in
+    metadata.json. It falls back to ``AUTO_CAPTION_STYLE`` for clips captioned
+    before that was recorded.
+
+    The captioned file is written ALONGSIDE the clip as
+    ``subtitled_<ts>_<clip>.mp4`` — the same convention /api/subtitle uses — so
+    the untouched original stays on disk and re-styling replaces the captions
+    instead of burning a second layer over them.
+
+    Returns the captioned path, or None when captions were skipped (silent
+    video, no words in range, or any failure — a caption problem must never
+    cost the user the clip they already paid for).
+    """
+    if not transcript or not transcript.get('segments'):
+        return None  # silent video: nothing to caption
+    try:
+        style = {**AUTO_CAPTION_STYLE, **(style or {})}
+        output_dir = os.path.dirname(clip_path)
+        stem = os.path.basename(clip_path)
+        generation_id = int(time.time())
+        # The output name MUST stay exactly "subtitled_<ts>_<clip filename>":
+        # the modal's walk-back and _canonical_clip_file both reconstruct the
+        # clean original from it, so trimming the stem here would orphan the
+        # pair. Length is bounded upstream instead, by MAX_TITLE_BYTES at
+        # download time. A legacy clip whose name predates that budget can still
+        # overflow — that raises OSError 36, which the except below turns into
+        # "ship the clip uncaptioned" rather than a broken filename.
+        is_karaoke = str(style.get("style", "karaoke")).lower() != "classic"
+        subs_path = os.path.join(
+            output_dir,
+            f"autosubs_{generation_id}_{stem}.{'ass' if is_karaoke else 'srt'}")
+        out_path = os.path.join(output_dir, f"subtitled_{generation_id}_{stem}")
+
+        if is_karaoke:
+            generated = generate_ass(
+                transcript, clip_start, clip_end, subs_path,
+                max_chars=style["max_chars"], max_duration=style["max_duration"],
+                alignment=style["alignment"], fontsize=style["font_size"],
+                font_name=style["font_name"], font_color=style["font_color"],
+                border_color=style["border_color"], border_width=style["border_width"],
+                highlight_color=style["highlight_color"], effect=style["effect"],
+                bg_color=style.get("bg_color", "#000000"),
+                bg_opacity=style.get("bg_opacity", 0.0),
+                base_opacity=style["base_opacity"], uppercase=style["uppercase"])
+        else:
+            generated = generate_srt(
+                transcript, clip_start, clip_end, subs_path,
+                max_chars=style["max_chars"], max_duration=style["max_duration"])
+        if not generated:
+            print("   ℹ️ No words in range — clip stays uncaptioned.")
+            return None
+
+        burn_subtitles(
+            clip_path, subs_path, out_path,
+            alignment=style["alignment"], fontsize=style["font_size"],
+            font_name=style["font_name"], font_color=style["font_color"],
+            border_color=style["border_color"], border_width=style["border_width"],
+            bg_color=style.get("bg_color", "#000000"),
+            bg_opacity=style.get("bg_opacity", 0.0))
+        print(f"   💬 Captions burned: {os.path.basename(out_path)}")
+        return out_path
+    except Exception as e:
+        print(f"   ⚠️ Captions failed ({type(e).__name__}: {e}) — "
+              f"delivering the clip without them.")
+        return None
 
 
 def _ass_time(seconds):
@@ -284,7 +394,8 @@ def _dim_hex_color(hex_color, opacity, fallback="FFFFFF"):
 
 
 def generate_ass(transcript, clip_start, clip_end, output_path,
-                 max_chars=20, max_duration=2.0, alignment='bottom',
+                 max_chars=CAPTION_MAX_CHARS, max_duration=CAPTION_MAX_DURATION,
+                 alignment='bottom',
                  fontsize=16, font_name="Verdana", font_color="#FFFFFF",
                  border_color="#000000", border_width=2,
                  highlight_color="#FFD700", bg_color="#000000", bg_opacity=0.0,
@@ -306,7 +417,7 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
         return False
 
     # Match the SRT burn path: PlayResY 288 keeps font sizes consistent.
-    final_fontsize = int(_clamp_number(fontsize, 10, 200, 16) * 0.85)
+    final_fontsize = int(_clamp_number(fontsize, 10, 200, 16) * ASS_FONT_SCALE)
     if final_fontsize < 10:
         final_fontsize = 10
 
@@ -328,7 +439,10 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
     else:
         border_style = 1
         outline_colour = hex_to_ass_color(border_color, 1.0, fallback="000000")
-        outline_width = max(1, int(border_width))
+        # No floor at 1: the modal's border slider goes down to "None", and
+        # forcing an outline anyway burned a visible black edge onto captions
+        # the user had explicitly asked to have none (reported 28-jul-2026).
+        outline_width = int(border_width)
 
     back_colour = hex_to_ass_color("#000000", 0.0)
     highlight_inline = _hex_to_ass_inline_color(highlight_color, fallback="FFD700")
@@ -354,7 +468,7 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
-        "PlayResY: 288\n"
+        f"PlayResY: {ASS_PLAY_RES_Y}\n"
         "WrapStyle: 0\n"
         "ScaledBorderAndShadow: yes\n"
         "\n"
@@ -472,7 +586,7 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
 
     # Font size scaling for ASS virtual resolution (PlayResY=288 default)
     # For vertical 1080x1920 video, we need larger text for readability
-    final_fontsize = int(_clamp_number(fontsize, 10, 200, 16) * 0.85)
+    final_fontsize = int(_clamp_number(fontsize, 10, 200, 16) * ASS_FONT_SCALE)
     if final_fontsize < 10:
         final_fontsize = 10
 
@@ -492,10 +606,11 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
         outline_colour = hex_to_ass_color(bg_color, bg_opacity, fallback="000000")
         outline_width = 1
     else:
-        # Outline mode: text border/outline
+        # Outline mode: text border/outline. Width 0 means the user chose "None"
+        # in the modal and must render without an outline (see generate_ass).
         border_style = 1
         outline_colour = hex_to_ass_color(border_color, 1.0, fallback="000000")
-        outline_width = max(1, int(border_width))
+        outline_width = int(border_width)
 
     back_colour = hex_to_ass_color("#000000", 0.0)
 

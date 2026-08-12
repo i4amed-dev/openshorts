@@ -1,9 +1,13 @@
 services:
   backend:
     build: .
-    container_name: openshorts-backend
+    container_name: klippo-backend
     ports:
-      - "8000:8000"
+      # Host 8001, container 8000. Only the host side moved: the frontend and
+      # renderer reach the API as http://backend:8000 over the compose network
+      # (dashboard/vite.config.js), so nothing in the app depends on which host
+      # port this is. 8000 is left free for whatever else is using it locally.
+      - "8001:8000"
     volumes:
       - .:/app
       - /app/__pycache__
@@ -14,7 +18,7 @@ services:
     build:
       context: ./dashboard
       target: dev
-    container_name: openshorts-frontend
+    container_name: klippo-frontend
     ports:
       - "5175:5173"
     volumes:
@@ -28,7 +32,7 @@ services:
     build:
       context: .
       dockerfile: render-service/Dockerfile
-    container_name: openshorts-renderer
+    container_name: klippo-renderer
     ports:
       - "3100:3100"
     volumes:

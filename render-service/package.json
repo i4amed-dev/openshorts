@@ -1,5 +1,5 @@
 {
-  "name": "openshorts-render-service",
+  "name": "klippo-render-service",
   "version": "1.0.0",
   "private": true,
   "type": "module",

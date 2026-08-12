@@ -15,10 +15,16 @@ interface SubtitlesProps {
   config: SubtitleConfig;
 }
 
+// Offsets mirror the burn: FFmpeg places captions MarginV units from the edge
+// of a 288-unit-tall frame, and SAFE_MARGIN_V in subtitles.py is 43 — ~15%,
+// chosen to clear TikTok's and Reels' own bottom UI. The preview used 10%/12%,
+// which sat the caption lower than the file the user actually got.
+const SAFE_MARGIN_PCT = `${((43 / 288) * 100).toFixed(1)}%`;
+
 const POSITION_MAP: Record<string, React.CSSProperties> = {
-  top: { top: "12%", bottom: "auto" },
+  top: { top: SAFE_MARGIN_PCT, bottom: "auto" },
   middle: { top: "45%", bottom: "auto" },
-  bottom: { bottom: "10%", top: "auto" },
+  bottom: { bottom: SAFE_MARGIN_PCT, top: "auto" },
 };
 
 export const Subtitles: React.FC<SubtitlesProps> = ({ config }) => {
@@ -171,33 +177,53 @@ const WordSpan: React.FC<WordSpanProps> = ({
     }
   }
 
-  if (isActive) {
+  // What the burn will do to the spoken word (subtitles.py generate_ass builds
+  // the same five cases). `animation` is the older preview-only vocabulary and
+  // is mapped onto them so existing callers keep working.
+  const effect =
+    style.effect ??
+    (animation === "pop"
+      ? "pop"
+      : animation === "word-highlight"
+      ? "glow"
+      : animation === "karaoke"
+      ? "none"
+      : "static");
+
+  // "static" is the plain SRT burn: every word identical, no highlight. Any
+  // other effect recolors the spoken word.
+  if (isActive && effect !== "static") {
     color = style.highlightColor;
 
-    switch (animation) {
+    switch (effect) {
       case "pop": {
+        // Burn: \fscx90\fscy90 -> \fscx108\fscy108 over 110ms.
         const scale = spring({
           frame: frame - wordStartFrame,
           fps,
           config: { mass: 0.5, stiffness: 300, damping: 12 },
-          durationInFrames: 10,
+          durationInFrames: 4,
         });
-        const scaleValue = interpolate(scale, [0, 1], [1, 1.25]);
-        transform = `scale(${scaleValue})`;
+        transform = `scale(${interpolate(scale, [0, 1], [0.9, 1.08])})`;
         break;
       }
-      case "karaoke": {
+      case "glow": {
+        // Burn: \c white fill, \3c highlight outline, \bord3 \blur4 — the word
+        // goes WHITE inside a colored halo, it does not turn the highlight color.
+        const halo = Math.max(3, Math.floor(style.borderWidth) + 2) * (1920 / 288);
+        color = "#FFFFFF";
         extraStyle = {
-          backgroundColor: style.highlightColor,
-          color: style.bgColor || "#000000",
-          borderRadius: 4,
-          padding: "2px 6px",
+          textShadow: `0 0 ${halo}px ${style.highlightColor}, 0 0 ${halo / 2}px ${style.highlightColor}`,
         };
         break;
       }
-      case "word-highlight": {
+      case "box": {
+        // Burn: same white fill, but an unblurred slab of highlight around it.
+        color = "#FFFFFF";
         extraStyle = {
-          textShadow: `0 0 12px ${style.highlightColor}, 0 0 24px ${style.highlightColor}40`,
+          backgroundColor: style.highlightColor,
+          borderRadius: 4,
+          padding: "0 8px",
         };
         break;
       }
@@ -206,16 +232,21 @@ const WordSpan: React.FC<WordSpanProps> = ({
     }
   }
 
-  // Text stroke via textShadow (CSS paint-order not reliable in Remotion)
+  // Text stroke via textShadow (CSS paint-order not reliable in Remotion).
+  // Glow and box replace the outline on the spoken word — in the burn their
+  // \bord tag overrides both its width and its color — so it is not drawn.
+  const outlineReplaced = isActive && (effect === "glow" || effect === "box");
   const strokeShadow =
-    style.borderWidth > 0
+    style.borderWidth > 0 && !outlineReplaced
       ? [
           `${style.borderWidth}px 0 0 ${style.borderColor}`,
           `-${style.borderWidth}px 0 0 ${style.borderColor}`,
           `0 ${style.borderWidth}px 0 ${style.borderColor}`,
           `0 -${style.borderWidth}px 0 ${style.borderColor}`,
         ].join(", ")
-      : "none";
+      : null;
+
+  const shadows = [strokeShadow, extraStyle.textShadow].filter(Boolean).join(", ");
 
   return (
     <span
@@ -223,16 +254,14 @@ const WordSpan: React.FC<WordSpanProps> = ({
         fontFamily: fontStack,
         fontSize: style.fontSize,
         fontWeight: 700,
-        color: animation === "karaoke" && isActive ? undefined : color,
-        textShadow:
-          animation !== "karaoke"
-            ? [strokeShadow, extraStyle.textShadow].filter(Boolean).join(", ")
-            : strokeShadow,
+        color,
         transform,
         display: "inline-block",
         transition: "none",
         textTransform: style.uppercase ? "uppercase" : "none",
         ...extraStyle,
+        // After the spread: the composed value must win over extraStyle's own.
+        textShadow: shadows || undefined,
       }}
     >
       {word}

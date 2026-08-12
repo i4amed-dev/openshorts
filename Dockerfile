@@ -9,11 +9,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy and install Python dependencies
-# Copy and install Python dependencies
 COPY requirements.txt requirements-billing.txt ./
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --upgrade pip
+
+ARG GPU=0
+
+# torch's Linux wheels declare their CUDA dependencies as
+# `platform_system == "Linux"` with NO architecture or GPU guard, so a plain
+# `pip install -r requirements.txt` drags cudnn + nccl + cusparselt + nvshmem
+# (~1.6GB compressed, several GB unpacked) into a CPU-only image. That is what
+# the GPU=1 block below is supposed to be the opt-in for, and on a 30GB builder
+# disk it fails the build outright: "no space left on device" while unpacking
+# nvidia/cu13/lib/libnvJitLink.so.13 (28-jul-2026).
+#
+# So the default image installs the CPU builds first. The pins come out of
+# requirements.txt itself — no second copy to drift — and `==X` matches the
+# `X+cpu` local version, so the -r install below sees them as satisfied.
+RUN if [ "$GPU" != "1" ]; then \
+      pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+        $(grep -E '^(torch|torchvision)==' requirements.txt); \
+    fi
+
 RUN pip install --no-cache-dir -r requirements.txt
 # Cloud (paid mode) deps: installed always so one image serves both modes; they
 # are only imported when BILLING_ENABLED is set. Harmless/unused in self-host.
@@ -22,8 +40,8 @@ RUN pip install --no-cache-dir -r requirements-billing.txt
 # GPU build (--build-arg GPU=1): user-space CUDA libs only — the NVIDIA
 # container runtime injects the driver. cuBLAS 12 + cuDNN 9 for CTranslate2
 # (faster-whisper CUDA), onnx-asr + onnxruntime-gpu for Parakeet. Adds ~2GB,
-# so the default CPU image stays slim.
-ARG GPU=0
+# so the default CPU image stays slim. (ARG GPU is declared above, where it
+# also selects between the CPU and CUDA torch wheels.)
 RUN if [ "$GPU" = "1" ]; then \
       pip install --no-cache-dir \
         "nvidia-cublas-cu12<13" "nvidia-cudnn-cu12>=9,<10" \
@@ -83,9 +101,9 @@ COPY . .
 
 # Register the bundled fonts (Anton for Impact) and the UI-name -> real-font
 # aliases with fontconfig so libass resolves what the subtitle modal offers.
-RUN mkdir -p /usr/local/share/fonts/openshorts \
-    && cp fonts/*.ttf /usr/local/share/fonts/openshorts/ \
-    && cp fonts/openshorts-fontmap.conf /etc/fonts/conf.d/60-openshorts.conf \
+RUN mkdir -p /usr/local/share/fonts/klippo \
+    && cp fonts/*.ttf /usr/local/share/fonts/klippo/ \
+    && cp fonts/klippo-fontmap.conf /etc/fonts/conf.d/60-klippo.conf \
     && fc-cache -f
 
 # Create a non-root user (Moved up)

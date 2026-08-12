@@ -245,7 +245,11 @@ class TestBurnFilterFonts:
 
 
 class TestAutoCaptionDefaults:
-    """The caption look every clip now ships with (chosen 25-jul-2026)."""
+    """The fallback caption look, and the base every partial style merges onto.
+
+    Clips are not captioned with it automatically (see test_caption_clip.py) —
+    it is what a re-burn falls back to when no style was recorded.
+    """
 
     def test_style_is_complete(self):
         from subtitles import AUTO_CAPTION_STYLE, generate_ass

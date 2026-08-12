@@ -9,7 +9,6 @@ import Modal from './ui/Modal';
 import SegmentedControl from './ui/SegmentedControl';
 import WatermarkModal, { watermarkNoticeDismissed } from './WatermarkModal';
 import { useAuth } from '../contexts/AuthContext';
-import { renderInBrowser } from '../lib/renderInBrowser';
 
 const QUIET_BTN = 'group flex flex-col items-center justify-center gap-1 py-2 px-1 rounded-input border border-rule hover:bg-paper3 text-[11px] lowercase text-ink2 whitespace-nowrap transition-colors disabled:opacity-45 disabled:cursor-not-allowed';
 
@@ -32,16 +31,16 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
     const [showWatermarkModal, setShowWatermarkModal] = useState(false);
     const { plan } = useAuth();
     const videoRef = React.useRef(null);
-    // Pristine base clip (no burned subtitles/hook), stable regardless of how
-    // clip.video_url mutates after server edits. Used as the compositing base
-    // for the Remotion preview so it never stacks subtitles over an already-
-    // subtitled file (double-subtitle bug).
-    const stripBurns = (filename) => {
+    // Base clip for the modal previews: the current server file with its burned
+    // captions stripped off. That is exactly what /api/subtitle and /api/hook
+    // feed their own FFmpeg pass (both strip captions first so a restyle can't
+    // stack a second layer), so previewing on it shows the same starting frame
+    // the burn will use — including a hook that was already burned in.
+    const stripCaptions = (filename) => {
         let f = filename || '', prev;
-        do { prev = f; f = f.replace(/^subtitled_\d+_/, '').replace(/^hook_/, ''); } while (f !== prev);
+        do { prev = f; f = f.replace(/^subtitled_\d+_/, ''); } while (f !== prev);
         return f;
     };
-    const originalVideoUrl = getApiUrl((clip.video_url || '').replace(/[^/]+$/, stripBurns((clip.video_url || '').split('/').pop())));
     const [currentVideoUrl, setCurrentVideoUrl] = useState(getApiUrl(clip.video_url));
 
     const downloadClip = async () => {
@@ -63,13 +62,19 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
             window.open(currentVideoUrl, '_blank');
         }
     };
-    // Latest file that exists ON THE SERVER (blob: previews don't count).
-    // All server-side operations must chain from this, so burned-in edits
-    // (subtitles, hooks, effects) never get silently dropped.
+    // The clip's current file on the server — what the player shows, what
+    // posting uploads, and what every further edit chains from, so burned-in
+    // work (subtitles, hooks, effects) is never silently dropped.
     // A reopened project seeds it from the persisted project state.
     const [serverVideoFile, setServerVideoFile] = useState(initialState?.server_file || (clip.video_url || '').split('/').pop());
     const [videoErrored, setVideoErrored] = useState(false);
     const [resolution, setResolution] = useState(null);
+
+    // Preview source: same directory as the clip, current server file, captions
+    // stripped. Derived from serverVideoFile (not clip.video_url) so it follows
+    // an edit immediately instead of waiting for the next job refresh.
+    const previewVideoUrl = getApiUrl(
+        (clip.video_url || '').replace(/[^/]+$/, stripCaptions(serverVideoFile)));
 
     // If the local video failed and a durable R2 URL is (now) available, use it.
     // Handles the race where the video errors before the durable URL has loaded.
@@ -126,37 +131,21 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
     const [showTranslateModal, setShowTranslateModal] = useState(false);
     const [editError, setEditError] = useState(null);
 
-    const [clipDuration, setClipDuration] = useState(clip.end && clip.start ? clip.end - clip.start : 30);
-
-    // Accumulate Remotion layers across operations. A reopened project restores
-    // the layers persisted in its project state, so the next edit composes over
-    // them instead of silently dropping previous browser-side work.
-    const [activeLayers, setActiveLayers] = useState(initialState?.active_layers || { subtitles: null, hook: null, effects: null });
-
     // Report edit state upward (debounced sync to the project record). Skip the
-    // mount run: only user-driven changes are worth persisting.
+    // mount run: only user-driven changes are worth persisting. Every edit is a
+    // real file on the server now, so the file name IS the state — there are no
+    // browser-only Remotion layers left to carry alongside it.
     const stateReported = React.useRef(false);
     useEffect(() => {
         if (!stateReported.current) { stateReported.current = true; return; }
-        onStateChange?.(index, { activeLayers, serverVideoFile });
+        onStateChange?.(index, { serverVideoFile });
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeLayers, serverVideoFile]);
+    }, [serverVideoFile]);
 
-    // True when the current server file already carries burned-in content.
-    // Browser (Remotion) renders compose over the ORIGINAL clip, so using them
-    // here would silently drop those burns — chain via server FFmpeg instead.
-    const hasServerBurns = /(^|_)(subtitled|hook)_/.test(serverVideoFile || '');
-
-    // Fetch clip duration from transcript endpoint
-    useEffect(() => {
-        if (!jobId || index === undefined) return;
-        apiFetch(`/api/clip/${jobId}/${index}/transcript`)
-            .then(res => res.ok ? res.json() : null)
-            .then(data => {
-                if (data && data.durationSec) setClipDuration(data.durationSec);
-            })
-            .catch(() => {});
-    }, [jobId, index]);
+    // Whether this clip currently carries burned captions. Clips are delivered
+    // without them (the user picks a style in the subtitle modal), so the
+    // "remove captions" escape hatch only makes sense once there are some.
+    const hasBurnedCaptions = /(^|_)subtitled_/.test(serverVideoFile || '');
 
     // Which platforms the selected profile actually has linked. `null` means
     // unknown (profile list not loaded) — in that case nothing is gated.
@@ -204,39 +193,10 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
             }
             const geminiHeaders = apiKey ? { 'X-Gemini-Key': apiKey } : {};
 
-            // Try Remotion effects endpoint first
-            const effectsRes = hasServerBurns ? null : await apiFetch('/api/effects/generate', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    ...geminiHeaders
-                },
-                body: JSON.stringify({
-                    job_id: jobId,
-                    clip_index: index,
-                    input_filename: serverVideoFile
-                })
-            });
-
-            if (effectsRes && effectsRes.ok) {
-                const data = await effectsRes.json();
-                if (data.effects && data.effects.segments) {
-                    const newLayers = { ...activeLayers, effects: data.effects };
-                    setActiveLayers(newLayers);
-                    const blobUrl = await renderInBrowser({
-                        videoUrl: originalVideoUrl,
-                        durationInSeconds: clipDuration,
-                        subtitles: newLayers.subtitles,
-                        hook: newLayers.hook,
-                        effects: newLayers.effects,
-                    });
-                    setCurrentVideoUrl(blobUrl);
-                    if (videoRef.current) videoRef.current.load();
-                    return;
-                }
-            }
-
-            // Fallback: legacy FFmpeg edit endpoint
+            // Server-side FFmpeg edit. The in-browser Remotion effects render
+            // that used to run here produced a blob that only existed in this
+            // tab: posting uploads the file on the server, so the effects never
+            // reached the published clip (and were lost on reload).
             const res = await apiFetch('/api/edit', {
                 method: 'POST',
                 headers: {
@@ -277,9 +237,8 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
         }
     };
 
-    // Clips are captioned by default, so "no captions" has to be reachable.
-    // Nothing is re-encoded: the server still holds the clean file next to the
-    // captioned one and just points this clip back at it.
+    // Undo a caption burn. Nothing is re-encoded: the server still holds the
+    // clean file next to the captioned one and just points this clip back at it.
     const handleRemoveSubtitles = async () => {
         setIsSubtitling(true);
         setEditError(null);
@@ -294,21 +253,8 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
             if (!res.ok) throw new Error(await res.text());
             const data = await res.json();
             if (data.new_video_url) {
-                const serverUrl = getApiUrl(data.new_video_url);
                 setServerVideoFile(data.new_video_url.split('/').pop());
-                const remaining = { ...activeLayers, subtitles: null };
-                setActiveLayers(remaining);
-                if (remaining.hook || remaining.effects) {
-                    setCurrentVideoUrl(await renderInBrowser({
-                        videoUrl: serverUrl,
-                        durationInSeconds: clipDuration,
-                        subtitles: null,
-                        hook: remaining.hook,
-                        effects: remaining.effects,
-                    }));
-                } else {
-                    setCurrentVideoUrl(serverUrl);
-                }
+                setCurrentVideoUrl(getApiUrl(data.new_video_url));
                 if (videoRef.current) videoRef.current.load();
                 setShowSubtitleModal(false);
             }
@@ -324,27 +270,10 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
         setIsSubtitling(true);
         setEditError(null);
         try {
-            // Karaoke styles are burned server-side (ASS word-highlight render);
-            // the in-browser Remotion path only handles classic styles, and only
-            // when the server file has no burned-in content to preserve.
-            if (options.remotion && options.style !== 'karaoke' && !hasServerBurns) {
-                // Accumulate layer and render all layers together
-                const newLayers = { ...activeLayers, subtitles: options.remotion };
-                setActiveLayers(newLayers);
-                const blobUrl = await renderInBrowser({
-                    videoUrl: originalVideoUrl,
-                    durationInSeconds: clipDuration,
-                    subtitles: newLayers.subtitles,
-                    hook: newLayers.hook,
-                    effects: newLayers.effects,
-                });
-                setCurrentVideoUrl(blobUrl);
-                if (videoRef.current) videoRef.current.load();
-                setShowSubtitleModal(false);
-                return;
-            }
-
-            // Fallback: legacy FFmpeg
+            // Always burn server-side. The in-browser Remotion render only ever
+            // produces a blob in this tab, and posting/downloading/archiving all
+            // read the file on the server — so a browser-rendered caption layer
+            // would be missing from the clip that actually gets published.
             const res = await apiFetch('/api/subtitle', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -371,25 +300,8 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
             if (!res.ok) throw new Error(await res.text());
             const data = await res.json();
             if (data.new_video_url) {
-                const serverUrl = getApiUrl(data.new_video_url);
                 setServerVideoFile(data.new_video_url.split('/').pop());
-                // Subtitles are burned into the server file now — drop the
-                // browser subtitle layer and re-compose any remaining browser
-                // layers (hook/effects) over the new file so they aren't lost.
-                const remaining = { ...activeLayers, subtitles: null };
-                setActiveLayers(remaining);
-                if (remaining.hook || remaining.effects) {
-                    const blobUrl = await renderInBrowser({
-                        videoUrl: serverUrl,
-                        durationInSeconds: clipDuration,
-                        subtitles: null,
-                        hook: remaining.hook,
-                        effects: remaining.effects,
-                    });
-                    setCurrentVideoUrl(blobUrl);
-                } else {
-                    setCurrentVideoUrl(serverUrl);
-                }
+                setCurrentVideoUrl(getApiUrl(data.new_video_url));
                 if (videoRef.current) videoRef.current.load();
                 setShowSubtitleModal(false);
             }
@@ -405,24 +317,9 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
         setIsHooking(true);
         setEditError(null);
         try {
-            if (hookData.remotion && !hasServerBurns) {
-                // Accumulate layer and render all layers together
-                const newLayers = { ...activeLayers, hook: hookData.remotion };
-                setActiveLayers(newLayers);
-                const blobUrl = await renderInBrowser({
-                    videoUrl: originalVideoUrl,
-                    durationInSeconds: clipDuration,
-                    subtitles: newLayers.subtitles,
-                    hook: newLayers.hook,
-                    effects: newLayers.effects,
-                });
-                setCurrentVideoUrl(blobUrl);
-                if (videoRef.current) videoRef.current.load();
-                setShowHookModal(false);
-                return;
-            }
-
-            // Fallback: legacy FFmpeg
+            // Server-side FFmpeg overlay, for the same reason subtitles are:
+            // an in-browser render lives only in this tab, so posting (which
+            // uploads the server file) would publish a clip with no hook.
             const payload = typeof hookData === 'string'
                 ? { text: hookData, position: 'top', size: 'M' }
                 : hookData;
@@ -934,13 +831,13 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
                     setShowSubtitleModal(false);
                 } : undefined}
                 onRemove={handleRemoveSubtitles}
+                hasCaptions={hasBurnedCaptions}
                 bulkCount={clipCount}
                 bulkProgress={bulkProgress}
                 isProcessing={isSubtitling || (bulkProgress?.running ?? false)}
-                videoUrl={originalVideoUrl}
+                videoUrl={previewVideoUrl}
                 jobId={jobId}
                 clipIndex={index}
-                existingHook={activeLayers.hook}
             />
 
             <HookModal
@@ -948,10 +845,9 @@ export default function ResultCard({ clip, index, jobId, durableUrl, uploadPostK
                 onClose={() => setShowHookModal(false)}
                 onGenerate={handleHook}
                 isProcessing={isHooking}
-                videoUrl={originalVideoUrl}
+                videoUrl={previewVideoUrl}
                 initialText={clip.viral_hook_text}
                 durationInSeconds={clip.end && clip.start ? clip.end - clip.start : 30}
-                existingSubtitles={activeLayers.subtitles}
             />
 
             <TranslateModal

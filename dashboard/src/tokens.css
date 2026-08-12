@@ -20,13 +20,27 @@
   --color-rule-2: oklch(96% 0.006 262 / 0.14);
   --rule-blueprint: oklch(96% 0.006 262 / 0.04);
 
-  /* accents */
-  --color-accent: oklch(76% 0.17 50);
-  --color-accent-ink: oklch(17% 0.03 50);
-  --color-accent-2: oklch(68% 0.16 18);
-  --color-glow: oklch(80% 0.16 50 / 0.42);
-  --color-paper-emit: oklch(76% 0.17 50 / 0.04);
-  --color-focus: oklch(76% 0.17 50);
+  /* accents — Klippo primary. #219ebc is exactly oklch(64.8% 0.11 219), so the
+   * brand hex round-trips while the whole ramp stays in one hue and keeps the
+   * <alpha-value> form Tailwind needs. Interaction states step lightness down
+   * (hover, active) or up (accent-2, glow) rather than introducing a second blue.
+   *
+   * Contrast, measured against this theme rather than assumed:
+   *   accent on paper (text/icons, the common case in a dark UI) ... 6.4:1
+   *   accent-ink on accent (button label on a filled button) ....... 6.1:1
+   *   accent-hover / accent-active on paper ........................ 5.3:1 / 4.4:1
+   * White on accent is only 3.14:1, so filled surfaces keep accent-ink — the
+   * same dark-on-accent pairing the previous palette used. */
+  --color-accent: oklch(64.8% 0.11 219);
+  --color-accent-hover: oklch(58.8% 0.11 219);
+  --color-accent-active: oklch(52.8% 0.105 219);
+  --color-accent-ink: oklch(17% 0.03 230);
+  --color-accent-subtle: oklch(64.8% 0.11 219 / 0.12);
+  --color-accent-2: oklch(72% 0.11 219);
+  --color-glow: oklch(72% 0.11 219 / 0.42);
+  --color-paper-emit: oklch(64.8% 0.11 219 / 0.04);
+  --color-focus: oklch(64.8% 0.11 219);
+  --color-focus-ring: oklch(64.8% 0.11 219 / 0.45);
 
   /* states */
   --color-ok: oklch(75% 0.11 150);

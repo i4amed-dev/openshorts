@@ -16,8 +16,8 @@ export default defineConfig({
   plugins: [react(), seo()],
   server: {
     allowedHosts: [
-      'openshorts.app',
-      'www.openshorts.app'
+      'klippo.one',
+      'www.klippo.one'
     ],
     proxy: {
       '/api': { target: backend, changeOrigin: true },

@@ -145,7 +145,7 @@ class Settings:
 
     @property
     def frontend_url(self) -> str:
-        return os.environ.get("FRONTEND_URL", "https://openshorts.app").rstrip("/")
+        return os.environ.get("FRONTEND_URL", "https://klippo.one").rstrip("/")
 
     @property
     def allowed_origins(self) -> list:
@@ -177,7 +177,7 @@ class Settings:
     @property
     def email_from(self) -> str:
         # Namecheap requires the From to be the authenticated mailbox.
-        return os.environ.get("EMAIL_FROM") or (f"OpenShorts <{self.smtp_user}>" if self.smtp_user else "OpenShorts")
+        return os.environ.get("EMAIL_FROM") or (f"Klippo <{self.smtp_user}>" if self.smtp_user else "Klippo")
 
     @property
     def admin_email(self) -> str:
@@ -229,8 +229,16 @@ class Settings:
         return os.environ.get("MANAGED_UPLOAD_POST_API_KEY", "")
 
     @property
-    def openshorts_logo_url(self) -> str:
-        return os.environ.get("OPENSHORTS_LOGO_URL", "https://openshorts.app/logo.png")
+    def brand_logo_url(self) -> str:
+        """Logo shown on the Upload-Post connect page.
+
+        KLIPPO_LOGO_URL is the current name; OPENSHORTS_LOGO_URL is still read so
+        deployments whose .env predates the rebrand keep working. Drop the
+        fallback once those are updated.
+        """
+        return (os.environ.get("KLIPPO_LOGO_URL")
+                or os.environ.get("OPENSHORTS_LOGO_URL")
+                or "https://klippo.one/brand/logo.png")
 
     # Cloudflare R2 (S3-compatible) — durable video library storage
     @property

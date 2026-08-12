@@ -15,17 +15,22 @@ export default {
         ink: "oklch(96% 0.006 262 / <alpha-value>)",
         ink2: "oklch(86% 0.01 262 / <alpha-value>)",
         muted: "oklch(64% 0.012 262 / <alpha-value>)",
-        brass: "oklch(76% 0.17 50 / <alpha-value>)",
-        brassink: "oklch(17% 0.03 50 / <alpha-value>)",
-        coral: "oklch(68% 0.16 18 / <alpha-value>)",
+        // Klippo primary ramp. `brass` and `coral` keep their names because ~200
+        // call sites use them; only the hue moved, from orange/coral to #219ebc.
+        brass: "oklch(64.8% 0.11 219 / <alpha-value>)",
+        brasshover: "oklch(58.8% 0.11 219 / <alpha-value>)",
+        brassactive: "oklch(52.8% 0.105 219 / <alpha-value>)",
+        brassink: "oklch(17% 0.03 230 / <alpha-value>)",
+        coral: "oklch(72% 0.11 219 / <alpha-value>)",
+        // semantic states — deliberately unchanged by the rebrand
         ok: "oklch(75% 0.11 150 / <alpha-value>)",
         warn: "oklch(78% 0.14 75 / <alpha-value>)",
         danger: "oklch(66% 0.18 25 / <alpha-value>)",
         // legacy aliases so untouched files degrade gracefully
         background: "oklch(13% 0.014 265 / <alpha-value>)",
         surface: "oklch(16.5% 0.015 265 / <alpha-value>)",
-        primary: "oklch(76% 0.17 50 / <alpha-value>)",
-        accent: "oklch(68% 0.16 18 / <alpha-value>)",
+        primary: "oklch(64.8% 0.11 219 / <alpha-value>)",
+        accent: "oklch(64.8% 0.11 219 / <alpha-value>)",
       },
       fontFamily: {
         display: "var(--font-display)",

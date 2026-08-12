@@ -1,8 +1,8 @@
 """Upload-Post white-label profiles for managed users.
 
-Each OpenShorts user maps to one Upload-Post profile (a container for their
+Each Klippo user maps to one Upload-Post profile (a container for their
 connected socials). We create it lazily and generate branded connection links so
-the user connects TikTok/IG/YouTube on a page that looks like OpenShorts.
+the user connects TikTok/IG/YouTube on a page that looks like Klippo.
 
 Docs: https://docs.upload-post.com/guides/user-profile-integration
 """
@@ -74,11 +74,11 @@ async def get_connect_url(username: str) -> str:
     """Generate a branded, single-use connection URL (~1h) for the user's socials."""
     payload = {
         "username": username,
-        "logoImage": settings.openshorts_logo_url,
+        "logoImage": settings.brand_logo_url,
         "connectTitle": "Connect your social accounts",
-        "connectDescription": "Link TikTok, Instagram and YouTube to post your shorts directly from OpenShorts.",
+        "connectDescription": "Link TikTok, Instagram and YouTube to post your shorts directly from Klippo.",
         "redirectUrl": f"{settings.frontend_url}/#/account?connected=1",
-        "redirectButtonText": "Back to OpenShorts",
+        "redirectButtonText": "Back to Klippo",
         "platforms": CONNECT_PLATFORMS,
         "showCalendar": True,  # keep the scheduling calendar available in the page
     }

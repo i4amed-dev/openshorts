@@ -1,4 +1,4 @@
-"""Optional cloud (paid / managed-keys) mode for OpenShorts.
+"""Optional cloud (paid / managed-keys) mode for Klippo.
 
 This whole package is dormant unless the ``BILLING_ENABLED`` env flag is set.
 ``app.py`` imports it only in that case, so self-hosters never need the extra

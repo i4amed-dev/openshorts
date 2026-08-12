@@ -34,15 +34,53 @@ const HIGHLIGHT_PRESETS = [
 const ANIMATION_OPTIONS = [
     { value: 'pop', label: 'Pop' },
     { value: 'word-highlight', label: 'Glow' },
+    { value: 'box', label: 'Boxed' },
     { value: 'karaoke', label: 'Karaoke' },
     { value: 'none', label: 'None' },
 ];
+
+// The burn is the deliverable, the Remotion preview only illustrates it — so
+// picking an animation has to change what FFmpeg renders, not just the preview.
+// Each option maps onto the server's (style, effect) pair.
+const ANIMATION_BURN = {
+    'pop': { style: 'karaoke', effect: 'pop' },
+    'word-highlight': { style: 'karaoke', effect: 'glow' },
+    'box': { style: 'karaoke', effect: 'box' },
+    'karaoke': { style: 'karaoke', effect: 'none' },
+    'none': { style: 'classic', effect: 'none' },
+};
+
+// SubtitleAnimation (remotion/lib/types.ts) predates "box" and is still what the
+// render service validates, so the preview config carries a legal value there —
+// `effect` is what the preview actually renders from.
+const LEGACY_ANIMATION = { box: 'karaoke' };
 
 const POSITION_OPTIONS = [
     { value: 'top', label: 'top' },
     { value: 'middle', label: 'middle' },
     { value: 'bottom', label: 'bottom' },
 ];
+
+// Burn geometry, mirrored from subtitles.py (ASS_PLAY_RES_Y / ASS_FONT_SCALE).
+// FFmpeg burns captions into a virtual frame 288 units tall and libass scales
+// that to the real 1920-tall clip, so one style unit is 6.67 preview pixels and
+// the font is shrunk by 0.85 first. The preview ran at a flat 2.2x before, which
+// showed a caption 2.5x smaller than the one that actually got burned.
+// Math.floor mirrors the int() truncation both burn paths apply to the style.
+const ASS_UNIT_PX = 1920 / 288;
+const ASS_FONT_SCALE = 0.85;
+const previewFontPx = (size) => Math.floor(size * ASS_FONT_SCALE) * ASS_UNIT_PX;
+const previewBorderPx = (width) => Math.floor(width) * ASS_UNIT_PX;
+
+// Caption size, in the units /api/subtitle takes as font_size. One unit is
+// ~5.7px on a 1920-tall clip, so this spans roughly 3%-12% of the frame height.
+// The old fixed 24 sat at the top of that range and read as oversized.
+const SIZE_MIN = 10;
+const SIZE_MAX = 42;
+const SIZE_DEFAULT = 16;
+// What the burn will occupy vertically, as a share of the frame — the only
+// size unit that means anything to someone looking at the clip.
+const sizePercent = (size) => ((previewFontPx(size) / 1920) * 100).toFixed(1);
 
 // Ready-made caption looks burned server-side as karaoke ASS (word highlight):
 // dimmed base text + strong active word, optional glow/pop/box effect.
@@ -65,9 +103,9 @@ const swatchClass = (selected) =>
         ? 'ring-2 ring-[color:var(--color-accent)] ring-offset-2 ring-offset-[color:var(--color-paper-2)]'
         : 'ring-1 ring-[color:var(--color-rule-2)] hover:ring-[color:var(--color-accent)]'}`;
 
-export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll, onRemove, isProcessing, videoUrl, jobId, clipIndex, existingHook, bulkCount = 0, bulkProgress }) {
+export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll, onRemove, hasCaptions = false, isProcessing, videoUrl, jobId, clipIndex, existingHook, bulkCount = 0, bulkProgress }) {
     const [position, setPosition] = useState('bottom');
-    const [fontSize] = useState(24);
+    const [fontSize, setFontSize] = useState(SIZE_DEFAULT);
     const [fontName, setFontName] = useState('Verdana');
     const [fontColor, setFontColor] = useState('#FFFFFF');
     const [highlightColor, setHighlightColor] = useState('#FFDD00');
@@ -78,9 +116,11 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     const [animation, setAnimation] = useState('pop');
     const [showTextEditor, setShowTextEditor] = useState(false);
 
-    // Karaoke (server-side ASS burn) state
-    const [style, setStyle] = useState('classic'); // classic | karaoke
-    const [effect, setEffect] = useState('none'); // none | glow | pop | box
+    // Karaoke (server-side ASS burn) state. Seeded to match the default
+    // animation above — the burn and the preview must describe the same look
+    // even when the user applies without touching a control.
+    const [style, setStyle] = useState(ANIMATION_BURN.pop.style);
+    const [effect, setEffect] = useState(ANIMATION_BURN.pop.effect);
     const [baseOpacity, setBaseOpacity] = useState(1.0);
     const [uppercase, setUppercase] = useState(false);
     const [activePreset, setActivePreset] = useState(null);
@@ -96,8 +136,21 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
         setBorderWidth(p.borderWidth);
         setFontColor('#FFFFFF');
         setBgOpacity(0);
-        // Keep the Remotion preview roughly in sync with the burned look
-        setAnimation(p.style === 'karaoke' ? (p.effect === 'pop' ? 'pop' : p.effect === 'glow' ? 'word-highlight' : 'karaoke') : 'none');
+        // Point the Animation control at the same burn the preset just chose.
+        const fromEffect = { pop: 'pop', glow: 'word-highlight', box: 'box', none: 'karaoke' };
+        setAnimation(p.style === 'karaoke' ? fromEffect[p.effect] : 'none');
+    };
+
+    // Changing the animation by hand overrides the preset's effect: the user is
+    // no longer on a preset, and the burn must follow what they just picked.
+    const applyAnimation = (value) => {
+        setAnimation(value);
+        const burn = ANIMATION_BURN[value];
+        if (burn) {
+            setStyle(burn.style);
+            setEffect(burn.effect);
+            setActivePreset(null);
+        }
     };
 
     // Remotion preview state
@@ -160,14 +213,18 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
         position,
         style: {
             fontFamily: fontName,
-            fontSize: fontSize * 2.2, // Scale up for 1080p (modal fontSize is for small preview)
+            // Same size the burn will produce — see previewFontPx above.
+            fontSize: previewFontPx(fontSize),
             fontColor,
             highlightColor,
             borderColor,
-            borderWidth: borderWidth * 1.5,
+            borderWidth: previewBorderPx(borderWidth),
             bgColor,
             bgOpacity,
-            animation,
+            animation: LEGACY_ANIMATION[animation] || animation,
+            // What FFmpeg will actually do to the spoken word. "classic" burns
+            // a plain SRT, which has no per-word highlight at all.
+            effect: style === 'classic' ? 'static' : effect,
             // Karaoke look reflected live in the playable preview.
             baseOpacity: style === 'karaoke' ? baseOpacity : 1,
             uppercase: style === 'karaoke' ? uppercase : false,
@@ -296,13 +353,33 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                             />
                         </div>
 
+                        {/* Caption size */}
+                        <div>
+                            <div className="flex justify-between mb-1">
+                                <p className="eyebrow">Size</p>
+                                <span className="readout">{sizePercent(fontSize)}% of frame</span>
+                            </div>
+                            <input
+                                type="range"
+                                min={SIZE_MIN}
+                                max={SIZE_MAX}
+                                value={fontSize}
+                                onChange={(e) => setFontSize(parseInt(e.target.value))}
+                                className="w-full accent-[var(--color-accent)]"
+                            />
+                            <div className="flex justify-between">
+                                <span className="readout">Small</span>
+                                <span className="readout">Large</span>
+                            </div>
+                        </div>
+
                         {/* Animation Style (new) */}
                         <div>
                             <p className="eyebrow mb-2">Animation</p>
                             <SegmentedControl
                                 options={ANIMATION_OPTIONS}
                                 value={animation}
-                                onChange={setAnimation}
+                                onChange={applyAnimation}
                                 columns={2}
                                 size="sm"
                             />
@@ -365,21 +442,26 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                             </div>
                         </div>
 
-                        {/* Highlight Color (new) */}
-                        <div>
-                            <p className="eyebrow mb-2">Highlight</p>
-                            <div className="flex flex-wrap items-center gap-2.5">
-                                {HIGHLIGHT_PRESETS.map((c) => (
-                                    <button
-                                        key={c.color}
-                                        onClick={() => setHighlightColor(c.color)}
-                                        className={swatchClass(highlightColor === c.color)}
-                                        style={{ backgroundColor: c.color }}
-                                        title={c.label}
-                                    />
-                                ))}
+                        {/* Highlight Color — only the word-by-word burns use it.
+                            Animation "none" burns a plain SRT with no spoken-word
+                            highlight, so offering the colour there is a control
+                            that visibly does nothing. */}
+                        {style !== 'classic' && (
+                            <div>
+                                <p className="eyebrow mb-2">Highlight</p>
+                                <div className="flex flex-wrap items-center gap-2.5">
+                                    {HIGHLIGHT_PRESETS.map((c) => (
+                                        <button
+                                            key={c.color}
+                                            onClick={() => setHighlightColor(c.color)}
+                                            className={swatchClass(highlightColor === c.color)}
+                                            style={{ backgroundColor: c.color }}
+                                            title={c.label}
+                                        />
+                                    ))}
+                                </div>
                             </div>
-                        </div>
+                        )}
 
                         {/* Border / Outline */}
                         <div>
@@ -446,10 +528,10 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                         {(() => {
                             const styleOptions = {
                                 position, fontSize, fontName, fontColor, borderColor, borderWidth, bgColor, bgOpacity,
-                                // Karaoke burn (server-side ASS render)
+                                // What the server-side burn renders. The Remotion
+                                // config above stays a preview: it never leaves
+                                // the browser, so it can't be what ships.
                                 style, effect, baseOpacity, uppercase, highlightColor,
-                                // Remotion data
-                                remotion: useRemotionPreview ? subtitleConfig : null,
                             };
                             const bulkRunning = bulkProgress?.running;
                             return (
@@ -478,10 +560,10 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                                                 : `apply this style to all ${bulkCount} clips`}
                                         </button>
                                     )}
-                                    {/* Clips ship captioned by default, so the way
-                                        out has to be here — otherwise a user who
-                                        doesn't want captions is stuck with them. */}
-                                    {onRemove && (
+                                    {/* Only once this clip actually carries burned
+                                        captions — offering to remove captions from
+                                        a clip that has none reads as a bug. */}
+                                    {onRemove && hasCaptions && (
                                         <button
                                             onClick={onRemove}
                                             disabled={isProcessing}

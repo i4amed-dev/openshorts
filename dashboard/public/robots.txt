@@ -1,4 +1,4 @@
-# robots.txt for OpenShorts
+# robots.txt for Klippo
 # Search crawlers and AI crawlers are both welcome. Note that the AI crawlers
 # below do not execute JavaScript, so what they read is the static HTML shipped
 # by the build (the injected homepage content plus the standalone pages under
@@ -66,4 +66,4 @@ Allow: /
 User-agent: CCBot
 Allow: /
 
-Sitemap: https://www.openshorts.app/sitemap.xml
+Sitemap: https://klippo.one/sitemap.xml

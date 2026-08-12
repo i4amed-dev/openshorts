@@ -361,7 +361,7 @@ def _canonical_clip_file(output_dir, base_name, index):
     """The file to serve for clip ``index``, preferring a derived version.
 
     The pipeline writes the clean reframe as ``<base>_clip_<n>.mp4`` and any
-    post-processing (auto-captions, and /api/subtitle re-styles) as
+    post-processing (/api/subtitle burns and re-styles) as
     ``subtitled_<ts>_<clean>.mp4``, keeping the original for re-styling. Every
     place that rebuilds the canonical name from disk — restore after a restart,
     the R2 upload, the download bundle — must therefore resolve to the newest
@@ -393,13 +393,18 @@ def _strip_burned_captions(output_dir, filename):
 
 
 def _reapply_captions(job_id, clip_index, video_path):
-    """Re-burn the default captions onto a freshly derived file.
+    """Re-burn this clip's captions onto a freshly derived file.
 
     Captions must always be the LAST layer. Editing or hooking a clip that
     already had them burned in produced `edited_subtitled_<...>`, and the next
     subtitle pass then stacked a second caption layer on top of the first —
     visibly doubled and unreadable in real user clips (26-jul-2026). So the
     derivation runs on the clean file and captions go back on afterwards.
+
+    The style comes from ``caption_style`` on the clip, recorded by
+    /api/subtitle when the user chose it — re-burning the house default here
+    would silently replace the look they picked. Clips captioned before that was
+    recorded fall back to the default inside ``caption_clip``.
 
     Returns the captioned path, or None if there was nothing to caption.
     """
@@ -414,9 +419,10 @@ def _reapply_captions(job_id, clip_index, video_path):
         if not transcript or clip_index >= len(clips):
             return None
         clip = clips[clip_index]
-        import main as _main
-        return _main.auto_caption_clip(video_path, transcript,
-                                       clip['start'], clip['end'])
+        import subtitles as _subs
+        return _subs.caption_clip(video_path, transcript,
+                                  clip['start'], clip['end'],
+                                  style=clip.get('caption_style'))
     except Exception as e:
         print(f"⚠️  Could not re-apply captions to {video_path}: {e}")
         return None
@@ -1451,7 +1457,7 @@ async def download_all_clips(job_id: str, request: Request):
     return FileResponse(
         zip_path,
         media_type="application/zip",
-        filename=f"openshorts_clips_{job_id[:8]}.zip",
+        filename=f"klippo_clips_{job_id[:8]}.zip",
         background=BackgroundTask(os.remove, zip_path),
     )
 
@@ -1591,7 +1597,9 @@ async def _ensure_job_files(job_id: str, request: Request) -> bool:
 
 
 from editor import VideoEditor
-from subtitles import generate_srt, generate_ass, burn_subtitles, generate_srt_from_video
+from subtitles import (generate_srt, generate_ass, burn_subtitles,
+                       generate_srt_from_video,
+                       CAPTION_MAX_CHARS, CAPTION_MAX_DURATION)
 from hooks import add_hook_to_video
 from translate import translate_video, get_supported_languages
 from thumbnail import analyze_video_for_titles, refine_titles, generate_thumbnail, generate_youtube_description
@@ -2130,17 +2138,44 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
         await _metering.commit_reservation(reservation_id)
 
     # 3. Update Result and Metadata
+    # The look the user just picked, recorded alongside the clip: /api/edit and
+    # /api/hook derive from the CLEAN file and re-burn captions afterwards
+    # (_reapply_captions), which without this would put the house default back
+    # and quietly throw away the style chosen here.
+    caption_style = {
+        "style": req.style,
+        "alignment": req.position,
+        "font_name": req.font_name,
+        "font_size": req.font_size,
+        "font_color": req.font_color,
+        "highlight_color": req.highlight_color,
+        "border_color": req.border_color,
+        "border_width": req.border_width,
+        "bg_color": req.bg_color,
+        "bg_opacity": req.bg_opacity,
+        "effect": req.effect,
+        "base_opacity": req.base_opacity,
+        "uppercase": req.uppercase,
+        # Recorded explicitly: the re-burn merges this over AUTO_CAPTION_STYLE,
+        # whose tighter grouping (16 chars / 1.4s) would otherwise re-chunk the
+        # captions into different lines than the ones the user approved.
+        "max_chars": CAPTION_MAX_CHARS,
+        "max_duration": CAPTION_MAX_DURATION,
+    }
+
     # Update InMemory Jobs
     if req.clip_index < len(job['result']['clips']):
          job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
-    
+         job['result']['clips'][req.clip_index]['caption_style'] = caption_style
+
     # Update Metadata on Disk (Persistence)
     try:
         if req.clip_index < len(clips):
             clips[req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
+            clips[req.clip_index]['caption_style'] = caption_style
             # Update the main data structure
             data['shorts'] = clips
-            
+
             # Write back
             with open(json_files[0], 'w') as f:
                 json.dump(data, f, indent=4)
@@ -2166,10 +2201,9 @@ class RemoveSubtitlesRequest(BaseModel):
 async def remove_subtitles(req: RemoveSubtitlesRequest, request: Request):
     """Point a clip back at its un-captioned original.
 
-    Clips ship captioned by default now, so there has to be a way out — without
-    this, a user who doesn't want captions is stuck with them. No re-encode and
-    no quota: the pipeline always keeps the clean file next to the derived
-    ``subtitled_<ts>_`` one, so removing is just choosing the other file.
+    Undoing a caption burn must not cost a re-encode or any quota: the burn
+    always keeps the clean file next to the derived ``subtitled_<ts>_`` one, so
+    removing is just choosing the other file.
     """
     await require_managed_entitlement(request)
     await _ensure_job_files(req.job_id, request)
@@ -2208,8 +2242,11 @@ async def remove_subtitles(req: RemoveSubtitlesRequest, request: Request):
     new_url = f"/videos/{req.job_id}/{filename}"
     if req.clip_index < len(job.get('result', {}).get('clips', [])):
         job['result']['clips'][req.clip_index]['video_url'] = new_url
+        job['result']['clips'][req.clip_index].pop('caption_style', None)
     try:
         clips[req.clip_index]['video_url'] = new_url
+        # No captions means no style to restore after a later edit or hook.
+        clips[req.clip_index].pop('caption_style', None)
         data['shorts'] = clips
         with open(json_files[0], 'w') as f:
             json.dump(data, f, indent=4)
@@ -3452,7 +3489,7 @@ async def gallery_html_page():
           </div>
         </a>'''
 
-        ld_items.append(f'{{"@type":"ListItem","position":{i+1},"url":"https://openshorts.app/video/{video_id}","name":"{title}"}}')
+        ld_items.append(f'{{"@type":"ListItem","position":{i+1},"url":"https://klippo.one/video/{video_id}","name":"{title}"}}')
 
     ld_json = f'{{"@context":"https://schema.org","@type":"CollectionPage","name":"AI UGC Video Gallery","mainEntity":{{"@type":"ItemList","numberOfItems":{len(videos)},"itemListElement":[{",".join(ld_items)}]}}}}'
 
@@ -3460,10 +3497,10 @@ async def gallery_html_page():
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI UGC Video Gallery | OpenShorts</title>
+<title>AI UGC Video Gallery | Klippo</title>
 <meta name="description" content="Browse {len(videos)} AI-generated UGC marketing videos. Create viral TikTok and Instagram Reels for your SaaS product.">
 <meta name="robots" content="index, follow">
-<meta property="og:title" content="AI UGC Video Gallery | OpenShorts">
+<meta property="og:title" content="AI UGC Video Gallery | Klippo">
 <meta property="og:type" content="website">
 <meta property="og:description" content="Browse AI-generated UGC marketing videos for SaaS products.">
 <script type="application/ld+json">{ld_json}</script>
@@ -3478,7 +3515,7 @@ h1{{font-size:28px;font-weight:700;padding:40px 20px 0;text-align:center}}
 </style>
 </head>
 <body>
-<nav><strong style="font-size:18px">OpenShorts</strong><a href="/" class="cta">Create Your Video</a></nav>
+<nav><strong style="font-size:18px">Klippo</strong><a href="/" class="cta">Create Your Video</a></nav>
 <h1>AI-Generated UGC Videos</h1>
 <p class="subtitle">{len(videos)} videos generated · Low Cost & Premium modes</p>
 <div class="grid">{cards_html}</div>
@@ -3519,7 +3556,7 @@ async def video_html_page(video_id: str):
 <html lang="{language}">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title} - AI UGC Video | OpenShorts</title>
+<title>{title} - AI UGC Video | Klippo</title>
 <meta name="description" content="{caption} {hashtags}">
 <meta property="og:type" content="video.other">
 <meta property="og:title" content="{title}">
@@ -3551,7 +3588,7 @@ h1{{font-size:22px;font-weight:700;margin-bottom:8px}}
 </style>
 </head>
 <body>
-<nav><strong>OpenShorts</strong><a href="/gallery">Gallery</a><span style="color:#3f3f46">›</span><span style="color:#e4e4e7;font-size:14px">{title}</span></nav>
+<nav><strong>Klippo</strong><a href="/gallery">Gallery</a><span style="color:#3f3f46">›</span><span style="color:#e4e4e7;font-size:14px">{title}</span></nav>
 <div class="container">
 <div><video src="{video_url}" poster="{actor_url}" controls autoplay playsinline style="aspect-ratio:9/16;object-fit:cover"></video></div>
 <div>

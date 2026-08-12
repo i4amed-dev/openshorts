@@ -11,6 +11,15 @@ export interface CaptionWord {
 export type SubtitleAnimation = "none" | "word-highlight" | "pop" | "karaoke";
 export type SubtitlePosition = "top" | "middle" | "bottom";
 
+// How the burn (subtitles.py generate_ass) renders the spoken word. The preview
+// mirrors these exactly, so the modal shows the caption the user will get:
+//   static - no per-word highlight at all (the plain SRT burn)
+//   none   - the word takes highlightColor
+//   pop    - highlightColor, briefly scaled up
+//   glow   - the word turns WHITE inside a blurred highlightColor halo
+//   box    - the word turns WHITE inside a solid highlightColor slab
+export type SubtitleEffect = "static" | "none" | "pop" | "glow" | "box";
+
 export interface SubtitleStyle {
   fontFamily: string;
   fontSize: number;
@@ -21,6 +30,9 @@ export interface SubtitleStyle {
   bgColor: string;
   bgOpacity: number;
   animation: SubtitleAnimation;
+  // What the burn will do to the active word. Preferred over `animation`,
+  // which describes the preview's own older repertoire.
+  effect?: SubtitleEffect;
   // Karaoke look: dim inactive words (0-1) and force uppercase.
   baseOpacity?: number;
   uppercase?: boolean;
@@ -90,6 +102,9 @@ export const subtitleStyleSchema = z.object({
   bgColor: z.string(),
   bgOpacity: z.number().min(0).max(1),
   animation: z.enum(["none", "word-highlight", "pop", "karaoke"]),
+  effect: z.enum(["static", "none", "pop", "glow", "box"]).optional(),
+  baseOpacity: z.number().min(0).max(1).optional(),
+  uppercase: z.boolean().optional(),
 });
 
 export const subtitleConfigSchema = z.object({

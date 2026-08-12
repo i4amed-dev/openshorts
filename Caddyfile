@@ -1,0 +1,42 @@
+# Klippo — TLS + routing for a single host. Caddy gets certificates from
+# Let's Encrypt automatically on first request; nothing to run by hand.
+#
+# Layout matches what the app already assumes:
+#   klippo.one      → the static dashboard
+#   api.klippo.one  → the FastAPI backend (dashboard/nginx.conf redirects
+#                     /gallery and /video/ here, and VITE_API_URL points at it)
+#   www.klippo.one  → 301 to the apex, which is the canonical host in the SEO
+#                     canonicals and sitemap
+
+{
+	# Replace with a real address you read: this is where expiry warnings go.
+	email {$ACME_EMAIL}
+}
+
+klippo.one {
+	encode zstd gzip
+	reverse_proxy frontend:80
+}
+
+www.klippo.one {
+	redir https://klippo.one{uri} permanent
+}
+
+api.klippo.one {
+	encode zstd gzip
+
+	# Uploads are whole video files, and clip rendering is minutes-long work.
+	# Caddy's defaults would cut both off.
+	request_body {
+		max_size 2GB
+	}
+	reverse_proxy backend:8000 {
+		transport http {
+			read_timeout 30m
+			write_timeout 30m
+		}
+		# The app trusts X-Forwarded-Proto to build https URLs (uvicorn runs with
+		# --proxy-headers); Caddy sets it, so OAuth redirect_uri comes out https.
+		header_up X-Forwarded-Proto {scheme}
+	}
+}

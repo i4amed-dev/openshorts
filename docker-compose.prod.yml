@@ -1,0 +1,76 @@
+# Production base for a single Hetzner host. Replaces docker-compose.yml (the
+# dev rig), it does not layer on top of it — the dev file bind-mounts your source,
+# runs the Vite dev server and publishes the API on a host port, none of which
+# belongs on a public box.
+#
+# Cloud/billing mode adds Postgres and the managed-key env on top:
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.cloud.yml \
+#     --env-file .env.prod up -d --build
+#
+# Only Caddy publishes ports. backend, renderer and frontend talk over the
+# compose network, so nothing but 80/443 is reachable from the internet.
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: klippo-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # ACME account + certificates; losing this re-issues
+      - caddy_config:/config
+    depends_on:
+      - frontend
+      - backend
+    restart: unless-stopped
+
+  backend:
+    build: .
+    container_name: klippo-backend
+    # No source bind mount: the image is the artifact. Only state is mounted.
+    volumes:
+      - ./output:/app/output
+      - ./uploads:/app/uploads
+      - hf_cache:/app/.cache/huggingface   # ASR models, so a redeploy re-downloads nothing
+    environment:
+      # Each job runs ffmpeg + whisper; the default of 5 will thrash a shared-vCPU box.
+      - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-2}
+      - RENDER_SERVICE_URL=http://renderer:3100
+    env_file:
+      - .env.prod
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./dashboard
+      target: prod          # nginx serving the static build, not the Vite dev server
+      args:
+        # Vite bakes this at BUILD time. It must be the public API origin, because
+        # the browser calls it directly — rebuild the image if it ever changes.
+        - VITE_API_URL=${VITE_API_URL:-https://api.klippo.one}
+    container_name: klippo-frontend
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  renderer:
+    build:
+      context: .
+      dockerfile: render-service/Dockerfile
+    container_name: klippo-renderer
+    volumes:
+      - ./output:/output
+    environment:
+      - REMOTION_BUNDLE_PATH=/app/remotion
+      - OUTPUT_DIR=/output
+      - PORT=3100
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
+  hf_cache:
