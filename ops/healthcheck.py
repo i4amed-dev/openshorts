@@ -28,7 +28,17 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO)
+
+# Read .env exactly as app.py does. Without this the check ran with only the
+# container's own environment and reported correctly-configured keys as missing
+# — a false alarm in the one tool whose job is to tell you the setup is sound.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(_REPO, ".env"))
+except ImportError:
+    pass
 
 OK, WARN, FAIL, SKIP = "ok", "warn", "fail", "skip"
 ICON = {OK: "✅", WARN: "⚠️ ", FAIL: "❌", SKIP: "· "}

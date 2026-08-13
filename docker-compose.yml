@@ -18,6 +18,14 @@ services:
       # already sent — i.e. duplicate processing and duplicate publishing after
       # an update. Backed up by copying output/autopilot/autopilot.db*.
       - autopilot-state:/app/output/autopilot
+    # Load .env into the container environment. Without this the keys reach only
+    # code that calls load_dotenv() AND only because the repo is bind-mounted —
+    # so an image-only deployment (no bind mount) would silently have no
+    # credentials, since .dockerignore correctly keeps .env out of the image.
+    # `required: false` so the stack still starts before you have written one.
+    env_file:
+      - path: .env
+        required: false
     environment:
       # One heavy pipeline at a time. Whisper + YOLO/MediaPipe + FFmpeg on an
       # M1 will happily consume every core and all the RAM; running two jobs
