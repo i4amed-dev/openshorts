@@ -81,10 +81,10 @@ DEFAULTS: Dict[str, Any] = {
     "eligibility": {
         "min_duration_seconds": 180,
         "max_duration_seconds": 5400,
-        "max_age_hours": 168,
-        "min_views": 5000,
-        "min_view_velocity_per_hour": 50.0,
-        "min_engagement_rate": 0.005,
+        "max_age_hours": 336,
+        "min_views": 1000,
+        "min_view_velocity_per_hour": 10.0,
+        "min_engagement_rate": 0.001,
         "require_captions": False,
         "min_definition": "hd",
         "exclude_made_for_kids": True,
@@ -281,14 +281,14 @@ def normalise(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                                         lo=60, hi=36000, field="eligibility.max_duration_seconds")
     if e["max_duration_seconds"] <= e["min_duration_seconds"]:
         raise ConfigError("eligibility.max_duration_seconds must exceed min_duration_seconds")
-    e["max_age_hours"] = _as_int(src.get("max_age_hours"), default=168,
+    e["max_age_hours"] = _as_int(src.get("max_age_hours"), default=336,
                                  lo=1, hi=24 * 365, field="eligibility.max_age_hours")
-    e["min_views"] = _as_int(src.get("min_views"), default=5000,
+    e["min_views"] = _as_int(src.get("min_views"), default=1000,
                              lo=0, hi=1_000_000_000, field="eligibility.min_views")
     e["min_view_velocity_per_hour"] = _as_float(src.get("min_view_velocity_per_hour"),
-                                                default=50.0, lo=0.0, hi=10_000_000.0,
+                                                default=10.0, lo=0.0, hi=10_000_000.0,
                                                 field="eligibility.min_view_velocity_per_hour")
-    e["min_engagement_rate"] = _as_float(src.get("min_engagement_rate"), default=0.005,
+    e["min_engagement_rate"] = _as_float(src.get("min_engagement_rate"), default=0.001,
                                          lo=0.0, hi=1.0,
                                          field="eligibility.min_engagement_rate")
     e["require_captions"] = _as_bool(src.get("require_captions"), default=False)

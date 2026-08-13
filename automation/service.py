@@ -56,8 +56,30 @@ class AutopilotService:
         self.db.connect()
         if self.db.load_settings() is None:
             self.db.save_settings(normalise(None))
+        else:
+            self._migrate_loose_defaults()
         self._orchestrator = Orchestrator(self.db, get_runtime())
         return self
+
+    def _migrate_loose_defaults(self) -> None:
+        """Bump eligibility thresholds that shipped too strict (one-time migration).
+
+        Only updates a field if it is still at the old default value — so
+        intentional user customisations (lower OR higher) are left alone.
+        """
+        raw = self.db.load_settings() or {}
+        e = raw.get("eligibility") or {}
+        upd: Dict[str, Any] = {}
+        if e.get("min_views") == 5000:
+            upd["min_views"] = 1000
+        if e.get("min_view_velocity_per_hour") == 50.0:
+            upd["min_view_velocity_per_hour"] = 10.0
+        if e.get("min_engagement_rate") == 0.005:
+            upd["min_engagement_rate"] = 0.001
+        if e.get("max_age_hours") == 168:
+            upd["max_age_hours"] = 336
+        if upd:
+            self.update_settings({"eligibility": upd})
 
     async def start(self) -> None:
         if self._task is not None:
