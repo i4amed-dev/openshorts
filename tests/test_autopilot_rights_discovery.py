@@ -152,7 +152,7 @@ class TestRightsRemainTheFinalAuthority:
 
 class TestQuotaBucketsInDiscovery:
     def test_search_exhaustion_still_allows_chart_discovery(self, db):
-        db.mark_quota_exhausted(utcnow() + timedelta(hours=5), "quotaExceeded",
+        db.mark_quota_exhausted(NOW + timedelta(hours=5), "quotaExceeded",
                                 bucket=BUCKET_SEARCH)
         config = base_config(discovery={"strategies": ["most_popular", "niche_search"],
                                         "topics": ["chess"]})
@@ -164,7 +164,7 @@ class TestQuotaBucketsInDiscovery:
         assert client.search_calls == 0
 
     def test_general_exhaustion_still_allows_niche_search(self, db):
-        db.mark_quota_exhausted(utcnow() + timedelta(hours=5), "quotaExceeded",
+        db.mark_quota_exhausted(NOW + timedelta(hours=5), "quotaExceeded",
                                 bucket=BUCKET_GENERAL)
         config = base_config(discovery={"strategies": ["most_popular", "niche_search"],
                                         "topics": ["chess"]})
@@ -176,7 +176,7 @@ class TestQuotaBucketsInDiscovery:
         assert client.search_calls == 1
 
     def test_discovery_parks_only_when_nothing_can_run(self, db):
-        db.mark_quota_exhausted(utcnow() + timedelta(hours=5), "quotaExceeded",
+        db.mark_quota_exhausted(NOW + timedelta(hours=5), "quotaExceeded",
                                 bucket=BUCKET_GENERAL)
         config = base_config(discovery={"strategies": ["most_popular"]})
         client = FakeYouTubeClient([make_record("vid00000001", now=NOW)])

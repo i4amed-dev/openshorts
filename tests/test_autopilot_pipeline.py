@@ -166,7 +166,10 @@ class TestDiscovery:
                                                           bucket="general")
         assert harness.discover() is False
         quota = harness.db.get_quota("youtube", "general")
-        assert parse_iso(quota["exhausted_until"]) > utcnow()
+        # Compare against the injected clock, not the wall clock: the block is
+        # computed from NOW, so asserting against real time makes the test
+        # expire the moment the real date passes the reset.
+        assert parse_iso(quota["exhausted_until"]) > NOW
         # A second attempt must not even reach the API.
         calls_before = harness.youtube.popular_calls
         assert run_async(harness.orchestrator.run_discovery(now=NOW)) is False
@@ -176,7 +179,7 @@ class TestDiscovery:
         """Independent allocations: one 403 must not disable the other strategy."""
         h = Harness(config=base_config(discovery={
             "strategies": ["most_popular", "niche_search"], "topics": ["chess"]}))
-        h.db.mark_quota_exhausted(utcnow() + timedelta(hours=5), "quotaExceeded",
+        h.db.mark_quota_exhausted(NOW + timedelta(hours=5), "quotaExceeded",
                                   bucket="search")
         assert h.discover() is True
         assert h.youtube.popular_calls == 1     # chart discovery still ran

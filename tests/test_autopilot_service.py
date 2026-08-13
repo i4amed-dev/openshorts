@@ -305,9 +305,11 @@ class TestStatusView:
         assert quota["search_blocked_until"] is None
 
     def test_a_parked_bucket_shows_when_it_lifts_without_blocking_the_other(self, service):
-        service.db.mark_quota_exhausted(utcnow() + timedelta(hours=4), "quotaExceeded",
+        service.db.mark_quota_exhausted(NOW + timedelta(hours=4), "quotaExceeded",
                                         bucket="search")
-        quota = service.status()["youtube_quota"]
+        # status() must be asked at the same instant the block was written
+        # against, or it correctly reports a lapsed block as clear.
+        quota = service.status(now=NOW)["youtube_quota"]
         assert quota["search_blocked_until"]
         assert quota["general_blocked_until"] is None
 
