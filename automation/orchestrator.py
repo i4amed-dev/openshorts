@@ -35,7 +35,7 @@ class Orchestrator:
         self.db = db
         self.runtime = runtime
         self._client_factory = client_factory or (lambda: YouTubeClient(
-            on_units=lambda units: self.db.add_quota_units(units)))
+            on_units=lambda units, bucket: self.db.add_quota_units(units, bucket=bucket)))
 
     # --- config ---------------------------------------------------------------
 
