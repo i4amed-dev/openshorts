@@ -110,27 +110,33 @@ def evaluate_and_store(db: AutopilotDB, config: Dict[str, Any],
                        now: Optional[datetime] = None) -> DiscoveryResult:
     """Persist candidates with their score, eligibility and rejection reason.
 
-    A video already in the database is never re-evaluated into a fresh pipeline
-    run — that is the primary dedup guard, and it is enforced by the UNIQUE
-    constraint on ``youtube_video_id`` rather than by this check alone.
+    Videos already in the database in a non-FILTERED state are skipped — the
+    UNIQUE constraint on ``youtube_video_id`` is the primary dedup guard.
+    FILTERED videos are re-evaluated: if the config was relaxed since they were
+    first seen, they can graduate to ELIGIBLE without being re-inserted.
     """
     now = now or utcnow()
     known = db.known_video_ids([r.video_id for r in records])
 
-    fresh = [r for r in records if r.video_id not in known]
-    duplicates = len(records) - len(fresh)
+    # FILTERED rows can be reconsidered when settings change.
+    # Every other known state is terminal or in-flight — those stay as-is.
+    filterable = db.filtered_video_ids([r.video_id for r in records if r.video_id in known])
 
-    channel_counts = {r.channel_id: db.channel_use_count(r.channel_id) for r in fresh
-                      if r.channel_id}
-    scored = ranking.score_candidates(fresh, config, now=now,
-                                      channel_use_counts=channel_counts,
-                                      previously_seen=known)
+    fresh = [r for r in records if r.video_id not in known]
+    re_eval = [r for r in records if r.video_id in filterable]
+    duplicates = len(records) - len(fresh) - len(re_eval)
+
+    channel_counts = {r.channel_id: db.channel_use_count(r.channel_id)
+                      for r in fresh + re_eval if r.channel_id}
 
     eligible_count = 0
     stored = 0
     reasons: Dict[str, int] = {}
 
-    for record, score, breakdown in scored:
+    # --- score and persist brand-new candidates ----------------------------------
+    for record, score, breakdown in ranking.score_candidates(
+            fresh, config, now=now,
+            channel_use_counts=channel_counts, previously_seen=known):
         source = _record_to_source(record, run_id)
         source.score = score
         source.score_breakdown = breakdown
@@ -154,6 +160,27 @@ def evaluate_and_store(db: AutopilotDB, config: Dict[str, Any],
             db.log_event("discovery", f"Rejected: {reason}", level="debug", run_id=run_id,
                          source_id=source_id, youtube_video_id=record.video_id,
                          data={"reason": reason, "title": record.title, "score": score})
+
+    # --- re-evaluate previously FILTERED candidates ------------------------------
+    for record, score, breakdown in ranking.score_candidates(
+            re_eval, config, now=now,
+            channel_use_counts=channel_counts, previously_seen=known):
+        source = db.get_source_by_video_id(record.video_id)
+        if source is None:
+            duplicates += 1
+            continue
+        channel_last = db.channel_last_selected(record.channel_id) if record.channel_id else None
+        ok, reason = eligibility.evaluate(record, config, now=now,
+                                          channel_last_used=channel_last)
+        db.set_source_score(source.id, score, breakdown, ok, reason)
+        if ok:
+            db.transition_source(source.id, SourceState.ELIGIBLE,
+                                 expected=[SourceState.FILTERED],
+                                 rejection_reason=None, eligible=1)
+            eligible_count += 1
+        else:
+            duplicates += 1
+            reasons[reason or "unknown"] = reasons.get(reason or "unknown", 0) + 1
 
     return DiscoveryResult(
         candidates=len(records), stored=stored, duplicates=duplicates,

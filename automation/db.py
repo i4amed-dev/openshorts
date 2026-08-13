@@ -740,6 +740,25 @@ class AutopilotDB:
             found.update(row["youtube_video_id"] for row in rows)
         return found
 
+    def filtered_video_ids(self, video_ids: Iterable[str]) -> set:
+        """Subset of ``video_ids`` whose rows are in the FILTERED state.
+
+        Used by discovery to re-evaluate previously rejected candidates when
+        eligibility settings have been relaxed.
+        """
+        ids = list(video_ids)
+        if not ids:
+            return set()
+        found = set()
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            rows = self.query(
+                f"SELECT youtube_video_id FROM discovered_source "
+                f"WHERE state = ? AND youtube_video_id IN ({','.join('?' * len(chunk))})",
+                [SourceState.FILTERED] + chunk)
+            found.update(row["youtube_video_id"] for row in rows)
+        return found
+
     # --- processing attempts --------------------------------------------------
 
     def record_processing_attempt(self, source_id: int, job_id: str, attempt_no: int) -> None:
