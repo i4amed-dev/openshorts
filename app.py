@@ -1176,11 +1176,24 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             # A broken Autopilot must never stop the manual app from serving.
             print(f"⚠️ Autopilot failed to start: {e}")
+    if os.environ.get("TELEGRAM_BOT_TOKEN"):
+        try:
+            from telegram_bot import start_bot
+            await start_bot()
+            print("📱 Telegram bot started.")
+        except Exception as e:
+            print(f"⚠️ Telegram bot failed to start: {e}")
     yield
     if AUTOPILOT_ENABLED:
         try:
             from automation.service import get_service
             await get_service().stop()
+        except Exception:
+            pass
+    if os.environ.get("TELEGRAM_BOT_TOKEN"):
+        try:
+            from telegram_bot import stop_bot
+            await stop_bot()
         except Exception:
             pass
     # Cleanup (optional: cancel worker)

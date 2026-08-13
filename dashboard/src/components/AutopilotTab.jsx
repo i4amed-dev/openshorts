@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Loader2 } from 'lucide-react';
 import AutopilotOps from './autopilot/AutopilotOps';
 import AutopilotSetup from './autopilot/AutopilotSetup';
+import AutopilotMonitor from './autopilot/AutopilotMonitor';
 import { apiFetch, apiJson } from '../lib/api';
 
 /**
@@ -31,7 +32,7 @@ const ACTIONS = {
 };
 
 export default function AutopilotTab() {
-    const [view, setView] = useState('ops');       // ops | setup
+    const [view, setView] = useState('monitor');   // monitor | ops | setup
     const [status, setStatus] = useState(null);
     const [settings, setSettings] = useState(null);
     const [busy, setBusy] = useState(false);
@@ -139,8 +140,35 @@ export default function AutopilotTab() {
                         schedules the clips — with no browser open.
                     </p>
                 </div>
-                {view === 'setup' && (
-                    <button onClick={() => setView('ops')} className="btn-quiet px-4 py-2 text-xs">
+                {view !== 'setup' ? (
+                    <div className="flex gap-1 bg-paper2 rounded-input p-1 self-start">
+                        <button
+                            onClick={() => setView('monitor')}
+                            className={`px-4 py-1.5 text-xs rounded transition-colors ${
+                                view === 'monitor'
+                                    ? 'bg-paper text-ink shadow-sm'
+                                    : 'text-muted hover:text-ink'}`}
+                        >
+                            monitor
+                        </button>
+                        <button
+                            onClick={() => setView('ops')}
+                            className={`px-4 py-1.5 text-xs rounded transition-colors ${
+                                view === 'ops'
+                                    ? 'bg-paper text-ink shadow-sm'
+                                    : 'text-muted hover:text-ink'}`}
+                        >
+                            manage
+                        </button>
+                        <button
+                            onClick={() => { setView('setup'); loadSettings(); }}
+                            className="px-4 py-1.5 text-xs rounded text-muted hover:text-ink transition-colors"
+                        >
+                            setup
+                        </button>
+                    </div>
+                ) : (
+                    <button onClick={() => setView('monitor')} className="btn-quiet px-4 py-2 text-xs">
                         back
                     </button>
                 )}
@@ -194,20 +222,22 @@ export default function AutopilotTab() {
                 </div>
             )}
 
-            {view === 'ops' ? (
+            {view === 'monitor' && <AutopilotMonitor status={status} />}
+            {view === 'ops' && (
                 <AutopilotOps
                     status={status}
                     busy={busy}
                     action={action}
                     onOpenSetup={() => { setView('setup'); loadSettings(); }}
                 />
-            ) : (
+            )}
+            {view === 'setup' && (
                 <AutopilotSetup
                     settings={settings}
                     onSave={saveSettings}
                     saving={saving}
                     error={error}
-                    onDone={() => setView('ops')}
+                    onDone={() => setView('monitor')}
                 />
             )}
         </div>
