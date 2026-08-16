@@ -129,7 +129,7 @@ def v1_database(tmp_path):
 class TestForwardMigration:
     def test_the_version_advances(self, v1_database):
         db = AutopilotDB(v1_database).connect()
-        assert db.query_one("PRAGMA user_version")[0] == SCHEMA_VERSION == 2
+        assert db.query_one("PRAGMA user_version")[0] == SCHEMA_VERSION == 3
         db.close()
 
     def test_no_row_is_lost(self, v1_database):
@@ -234,6 +234,51 @@ class TestForwardMigration:
         db.close()
 
 
+class TestV2ToV3Migration:
+    """Opportunity-scoring metadata: additive columns, existing rows preserved."""
+
+    def test_existing_source_rows_get_sensible_defaults(self, v1_database):
+        # A v1 database has no notion of technical/policy eligibility split —
+        # existing rows must default to "still allowed" rather than being
+        # silently reinterpreted as blocked.
+        db = AutopilotDB(v1_database).connect()
+        source = db.get_source_by_video_id("vid00000001")
+        assert source.technical_eligible is True
+        assert source.policy_eligible is True
+        assert source.discovery_lane is None
+        assert source.age_cohort is None
+        db.close()
+
+    def test_new_columns_are_writable_after_the_upgrade(self, v1_database):
+        db = AutopilotDB(v1_database).connect()
+        source = db.get_source_by_video_id("vid00000002")
+        db.set_source_score(source.id, 88.5, {"components": {}}, True, None,
+                            discovery_lane="EVERGREEN_WINNERS", age_cohort="EVERGREEN",
+                            technical_eligible=True, policy_eligible=False)
+        refreshed = db.get_source_by_video_id("vid00000002")
+        assert refreshed.discovery_lane == "EVERGREEN_WINNERS"
+        assert refreshed.age_cohort == "EVERGREEN"
+        assert refreshed.policy_eligible is False
+        assert refreshed.score == 88.5
+        db.close()
+
+    def test_new_cache_tables_exist_after_the_upgrade(self, v1_database):
+        db = AutopilotDB(v1_database).connect()
+        names = {row["name"] for row in db.query(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert {"channel_stats_cache", "semantic_evaluation"} <= names
+        db.close()
+
+    def test_migrating_twice_preserves_v3_cache_data(self, v1_database):
+        first = AutopilotDB(v1_database).connect()
+        first.save_channel_stats("UCabc", subscriber_count=1000, view_count=50000,
+                                 video_count=20)
+        first.close()
+        second = AutopilotDB(v1_database).connect()
+        assert second.get_channel_stats("UCabc")["subscriber_count"] == 1000
+        second.close()
+
+
 class TestFreshDatabase:
     def test_a_new_file_starts_at_the_current_version(self, tmp_path):
         db = AutopilotDB(str(tmp_path / "new.db")).connect()
@@ -245,6 +290,16 @@ class TestFreshDatabase:
         columns = {row[1] for row in db.query("PRAGMA table_info(publish_attempt)")}
         assert {"vendor_request_id", "vendor_job_id", "vendor_status", "vendor_results",
                 "last_status_check_at", "next_status_check_at", "finalized_at"} <= columns
+        db.close()
+
+    def test_a_new_file_has_the_v3_columns_and_tables(self, tmp_path):
+        db = AutopilotDB(str(tmp_path / "new.db")).connect()
+        columns = {row[1] for row in db.query("PRAGMA table_info(discovered_source)")}
+        assert {"discovery_lane", "age_cohort", "selection_tier", "technical_eligible",
+                "policy_eligible"} <= columns
+        tables = {row["name"] for row in db.query(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert {"channel_stats_cache", "semantic_evaluation"} <= tables
         db.close()
 
     def test_a_newer_schema_is_still_refused(self, tmp_path):

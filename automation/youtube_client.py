@@ -155,6 +155,37 @@ class VideoRecord:
         return ((self.like_count or 0) + (self.comment_count or 0)) / self.view_count
 
 
+@dataclass
+class ChannelRecord:
+    """A validated ``channels.list`` item, flattened to what channel context needs."""
+    channel_id: str
+    title: str = ""
+    subscriber_count: Optional[int] = None
+    view_count: Optional[int] = None
+    video_count: Optional[int] = None
+    hidden_subscriber_count: bool = False
+
+
+def parse_channel_item(item: Dict[str, Any]) -> Optional[ChannelRecord]:
+    if not isinstance(item, dict):
+        return None
+    channel_id = item.get("id")
+    if not channel_id or not isinstance(channel_id, str):
+        return None
+    snippet = item.get("snippet") or {}
+    stats = item.get("statistics") or {}
+    if not isinstance(stats, dict):
+        return None
+    return ChannelRecord(
+        channel_id=str(channel_id),
+        title=str(snippet.get("title") or "")[:200] if isinstance(snippet, dict) else "",
+        subscriber_count=_to_int(stats.get("subscriberCount")),
+        view_count=_to_int(stats.get("viewCount")),
+        video_count=_to_int(stats.get("videoCount")),
+        hidden_subscriber_count=bool(stats.get("hiddenSubscriberCount")),
+    )
+
+
 def _to_int(value: Any) -> Optional[int]:
     if value is None:
         return None
@@ -353,23 +384,33 @@ class YouTubeClient:
                                relevance_language: str = "en",
                                published_after: Optional[datetime] = None,
                                max_results: int = 25,
-                               creative_commons: bool = False) -> List[str]:
+                               creative_commons: bool = False,
+                               order: str = "viewCount",
+                               channel_id: str = "") -> List[str]:
         """``search.list`` — 1 unit from the SEARCH bucket (~100 calls/day).
 
         ``part`` must be ``snippet``: the current API documents that value as
         required for this method, and ``part=id`` — which this client used to
         send — is not accepted. We still read only the ids here; the statistics
         and contentDetails come from a much cheaper videos.list batch.
+
+        ``order`` varies by discovery lane: ``date`` surfaces genuinely new
+        uploads a viewCount sort would bury under established videos,
+        ``rating`` surfaces high like-ratio content regardless of reach, and
+        ``viewCount`` (the default) is what "biggest in the niche" needs.
+        ``channel_id`` scopes the search to one channel — an empty ``query``
+        with a ``channel_id`` returns that channel's own catalogue.
         """
         params: Dict[str, Any] = {
             "part": "snippet",
             "type": "video",
             "q": query[:200],
-            "order": "viewCount",
+            "order": order or "viewCount",
             "regionCode": region_code,
             "relevanceLanguage": relevance_language,
             "maxResults": max(1, min(50, max_results)),
             "safeSearch": "moderate",
+            "channelId": channel_id or None,
         }
         if published_after is not None:
             params["publishedAfter"] = published_after.astimezone(
@@ -402,6 +443,30 @@ class YouTubeClient:
             }, COST_VIDEOS_LIST)
             for item in data.get("items") or []:
                 record = parse_video_item(item, discovery_source=discovery_source)
+                if record is not None:
+                    out.append(record)
+        return out
+
+    async def channels(self, channel_ids: Sequence[str]) -> List["ChannelRecord"]:
+        """Batch ``channels.list`` — 50 ids per call, 1 unit each.
+
+        Used only for the cheap, quota-free-beyond-this-call baseline in
+        automation/channel_context.py (channel_view_count / video_count as a
+        proxy for "typical reach"). Sampling actual per-video recency-weighted
+        baselines would cost far more quota for a marginal accuracy gain — a
+        documented limitation, not an oversight.
+        """
+        clean = [c for c in dict.fromkeys(channel_ids) if c]
+        out: List[ChannelRecord] = []
+        for start in range(0, len(clean), 50):
+            chunk = clean[start:start + 50]
+            data = await self._get("channels", {
+                "part": "snippet,statistics",
+                "id": ",".join(chunk),
+                "maxResults": 50,
+            }, COST_VIDEOS_LIST)
+            for item in data.get("items") or []:
+                record = parse_channel_item(item)
                 if record is not None:
                     out.append(record)
         return out

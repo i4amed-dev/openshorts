@@ -5,7 +5,11 @@ Run as a short subprocess by app.py BEFORE a job starts, so the user can decide
 to abort (and e.g. refresh cookies) instead of burning 20+ minutes of
 transcription and rendering on a 360p-only source.
 
-Prints JSON to stdout: {"max_height": int, "mode": str, "cookies_invalid": bool}
+Prints JSON to stdout: {"max_height": int, "mode": str, "cookies_invalid": bool,
+"title": str, "channel": str, "duration": int}. The metadata fields are a free
+byproduct of the same extract_info() call the quality check already makes —
+the Telegram bot's manual-submission preview reuses them rather than making a
+second yt-dlp call.
 Always exits 0 — the caller treats probe failures as "unknown" and starts the
 job anyway (fail-open), where the in-job warning still applies.
 """
@@ -37,7 +41,8 @@ def main() -> int:
     parser.add_argument("--url", required=True)
     args = parser.parse_args()
 
-    result = {"max_height": 0, "mode": None, "cookies_invalid": False}
+    result = {"max_height": 0, "mode": None, "cookies_invalid": False,
+              "title": None, "channel": None, "duration": None}
     try:
         import yt_dlp
 
@@ -90,6 +95,10 @@ def main() -> int:
                 if max_height > result["max_height"]:
                     result["max_height"] = max_height
                     result["mode"] = mode
+                if not result["title"]:
+                    result["title"] = info.get("title")
+                    result["channel"] = info.get("channel") or info.get("uploader")
+                    result["duration"] = info.get("duration")
                 if result["max_height"] >= 1080:
                     break
             except Exception:

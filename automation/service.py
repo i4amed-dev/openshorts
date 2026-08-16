@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from . import discovery, scheduler
+from . import discovery, publishing, scheduler
 from .config import ConfigError, normalise
 from .db import AutopilotDB, iso, parse_iso, utcnow
 from .models import ClipState, EngineStatus, PublishState, SourceState
@@ -422,12 +422,43 @@ class AutopilotService:
         ok = await self.orchestrator.run_discovery(config, force=True)
         return {"ok": ok}
 
+    async def discover_dry_run(self) -> Dict[str, Any]:
+        """Discover, score, rank, and preview the pick — never submits or
+        publishes anything.
+
+        ``discovery.pick_next_source`` already has no side effect beyond
+        clearing an explicitly denylisted channel out of the queue (a
+        cleanup, not "starting processing"), so previewing a selection is
+        just calling it and not following through with ``_submit_source``.
+        Safe to run before leaving Autopilot unattended.
+        """
+        config = self.get_settings()
+        discovered = await self.run_discovery_now()
+        source, tier_or_reason = discovery.pick_next_source(self.db, config, now=utcnow())
+        return {
+            "discovery": discovered,
+            "would_select": _source_view(source) if source else None,
+            "selection_tier": tier_or_reason if source else None,
+            "diagnostic": None if source else discovery.explain_empty_selection(self.db, config),
+        }
+
     async def process_next_now(self) -> Dict[str, Any]:
         config = self.get_settings()
         if self.db.active_processing_source() is not None:
             return {"ok": False, "reason": "a source is already processing"}
         started = await self.orchestrator._start_next_source(config, now=utcnow())
         return {"ok": bool(started)}
+
+    async def process_source(self, source_id: int) -> Dict[str, Any]:
+        """Process THIS candidate now, chosen by an operator rather than the
+        ranking. Returns ``{ok, reason}`` — ``reason`` is always a real,
+        specific explanation, never a bare failure."""
+        config = self.get_settings()
+        if self.db.active_processing_source() is not None:
+            return {"ok": False, "reason": "A source is already processing."}
+        ok, reason = await self.orchestrator.start_specific_source(
+            source_id, config, now=utcnow())
+        return {"ok": ok, "reason": reason}
 
     def skip_source(self, source_id: int) -> bool:
         source = self.db.get_source(source_id)
@@ -534,6 +565,129 @@ class AutopilotService:
                           source_id=attempt.source_id)
         return True
 
+    def cancel_pending(self, attempt_id: int) -> bool:
+        """Cancel an attempt that has not been sent to Upload-Post at all —
+        safe to drop outright, unlike anything already in the vendor's hands."""
+        attempt = self.db.get_publish_attempt(attempt_id)
+        if attempt is None or attempt.state != PublishState.PENDING:
+            return False
+        self.db.set_publish_state(attempt_id, PublishState.CANCELED,
+                                  error="Canceled by the operator",
+                                  expected=[PublishState.PENDING])
+        self.db.set_clip_state(attempt.clip_id, ClipState.SKIPPED, "canceled_by_operator")
+        self.db.log_event("publishing", "Operator canceled this attempt before it was sent",
+                          publish_attempt_id=attempt_id, source_id=attempt.source_id)
+        return True
+
+    async def check_publish_status(self, attempt_id: int) -> bool:
+        """Ask Upload-Post what really happened to one attempt, on demand.
+
+        The same reconciliation `automation.publishing.reconcile_attempt` runs
+        on its own schedule — this just lets an operator pull it forward
+        instead of waiting for `next_status_check_at`.
+        """
+        attempt = self.db.get_publish_attempt(attempt_id)
+        if attempt is None or not (attempt.vendor_job_id or attempt.vendor_request_id):
+            return False
+        publisher = self.orchestrator.runtime.publisher
+        if publisher is None:
+            return False
+        api_key, _profile = publisher.credentials()
+        if not api_key:
+            return False
+        await publishing.reconcile_attempt(self.db, attempt, api_key=api_key, now=utcnow())
+        return True
+
+    async def cancel_scheduled_attempt(self, attempt_id: int) -> Dict[str, Any]:
+        """Ask Upload-Post to drop a future scheduled job for one attempt.
+
+        Same vendor call `emergency_stop` makes in bulk, here for a single
+        attempt an operator picked. Only ever CANCELED on the vendor's
+        confirmation — a 404 means "unknown or already run", not success.
+        """
+        attempt = self.db.get_publish_attempt(attempt_id)
+        if attempt is None or attempt.state not in (PublishState.SUBMITTED, PublishState.PUBLISHING):
+            return {"ok": False, "reason": "Only a submitted, not-yet-live post can be cancelled."}
+        if not attempt.vendor_job_id:
+            return {"ok": False, "reason": "No vendor schedule to cancel."}
+        publisher = self.orchestrator.runtime.publisher
+        api_key = None
+        if publisher is not None:
+            api_key, _profile = publisher.credentials()
+        if not api_key:
+            return {"ok": False, "reason": "Upload-Post is not configured."}
+
+        import publishing_service
+        try:
+            outcome, detail = await publishing_service.cancel_scheduled(api_key, attempt.vendor_job_id)
+        except Exception as exc:
+            return {"ok": False, "reason": str(exc)[:200]}
+
+        if outcome == publishing_service.CancelOutcome.CANCELED:
+            self.db.set_publish_state(attempt_id, PublishState.CANCELED,
+                                      error="Canceled by the operator", next_status_check_at=None)
+            self.db.set_clip_state(attempt.clip_id, ClipState.SKIPPED, "canceled_by_operator")
+            self.db.log_event("publishing", "Operator cancelled this scheduled post",
+                              publish_attempt_id=attempt_id, source_id=attempt.source_id)
+            return {"ok": True, "reason": "Cancelled."}
+        if outcome == publishing_service.CancelOutcome.NOT_FOUND:
+            self.db.set_publish_state(attempt_id, PublishState.UNCERTAIN,
+                                      error=f"Cancel requested: {detail}",
+                                      next_status_check_at=iso(utcnow()))
+            return {"ok": False, "reason": "Upload-Post has no record of it — it may already be live. "
+                                           "Marked UNCERTAIN for reconciliation."}
+        return {"ok": False, "reason": f"Upload-Post could not cancel it: {detail}"}
+
+    def schedule_clip(self, clip_id: int, platforms: List[str], *,
+                       day, hhmm: str) -> Dict[str, Any]:
+        """Manually schedule one clip at an operator-chosen date/time/platform
+        set — the counterpart to `automation.publishing.schedule_clips`'
+        automatic slot allocation. Reuses the exact same reservation building
+        blocks (idempotency key, `reserve_publish_attempt`'s DB-enforced
+        uniqueness), so the orchestrator's normal dispatch tick picks this row
+        up and sends it exactly like an Autopilot-scheduled post — Telegram
+        never talks to Upload-Post directly.
+        """
+        clip = self.db.get_clip(clip_id)
+        if clip is None:
+            return {"ok": False, "reason": "Clip not found."}
+        if clip.state != ClipState.PENDING:
+            return {"ok": False, "reason": f"This clip is {clip.state.lower()}, not pending."}
+        config = self.get_settings()
+        allowed = set((config.get("publishing") or {}).get("platforms") or [])
+        chosen = [p for p in platforms if p in allowed]
+        if not chosen:
+            return {"ok": False, "reason": "No configured platform was selected."}
+
+        tz = scheduler.get_zone(config.get("timezone") or "UTC")
+        try:
+            slot = scheduler.local_slot_to_utc(day, hhmm, tz)
+        except (ValueError, KeyError) as exc:
+            return {"ok": False, "reason": f"Invalid date/time: {exc}"}
+        if slot <= utcnow():
+            return {"ok": False, "reason": "That time has already passed."}
+
+        from .models import PublishAttempt
+        attempt = PublishAttempt(
+            clip_id=clip.id or 0, source_id=clip.source_id, job_id=clip.job_id,
+            clip_index=clip.clip_index,
+            idempotency_key=publishing.idempotency_key(clip.job_id, clip.clip_index, chosen),
+            platforms=chosen, scheduled_for_utc=iso(slot),
+            timezone=config.get("timezone") or "UTC",
+            title=clip.title or "Viral Short", description=clip.description or "",
+        )
+        attempt_id = self.db.reserve_publish_attempt(attempt)
+        if attempt_id is None:
+            return {"ok": False, "reason": "That slot or clip already has a publish attempt."}
+        self.db.set_clip_state(clip.id, ClipState.SCHEDULED)
+        self.db.log_event("publishing",
+                          f"Clip {clip.clip_index + 1} manually scheduled for {iso(slot)}",
+                          source_id=clip.source_id, job_id=clip.job_id,
+                          publish_attempt_id=attempt_id,
+                          data={"slot_utc": iso(slot), "platforms": chosen,
+                                "scheduled_by": "operator"})
+        return {"ok": True, "attempt_id": attempt_id}
+
     # --- dashboard view -------------------------------------------------------
 
     def status(self, *, now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -577,6 +731,29 @@ class AutopilotService:
 
         lease = self.db.lease_holder() or {}
 
+        latest_run = next(iter(self.db.recent_runs(limit=1)), None)
+        latest_stats = (latest_run or {}).get("stats") or {}
+        discovery_funnel = {
+            "fetched": latest_stats.get("candidates", 0),
+            "stored": latest_stats.get("stored", 0),
+            "duplicates": latest_stats.get("duplicates", 0),
+            "eligible": latest_stats.get("eligible", 0),
+            "rejected": latest_stats.get("rejected", 0),
+            "shortlisted": len(self.db.list_sources(states=[SourceState.ELIGIBLE], limit=500)),
+            "selected": self.db.sources_selected_since(day_start),
+            "rejection_reasons": latest_stats.get("rejection_reasons", {}),
+            "lane_counts": latest_stats.get("lane_counts", {}),
+            "age_distribution": latest_stats.get("age_distribution", {}),
+            "average_opportunity": latest_stats.get("average_opportunity", 0.0),
+            "best_opportunity": latest_stats.get("best_opportunity", 0.0),
+            "lanes_run": latest_stats.get("lanes_run", []),
+            "semantic_evaluated": latest_stats.get("semantic_evaluated", 0),
+            "run_at": (latest_run or {}).get("started_at"),
+        }
+        selection_diagnostic = None
+        if active is None and discovery_funnel["selected"] == 0:
+            selection_diagnostic = discovery.explain_empty_selection(self.db, config)
+
         return {
             "enabled": bool(config.get("enabled")),
             "status": engine_status,
@@ -615,6 +792,8 @@ class AutopilotService:
             "recent_errors": self.db.recent_events(limit=15, level="error"),
             "events": self.db.recent_events(limit=40),
             "runs": self.db.recent_runs(limit=8),
+            "discovery_funnel": discovery_funnel,
+            "selection_diagnostic": selection_diagnostic,
             # Two independent allocations since 1-jun-2026 — reported separately
             # because exhausting one does not stop the other.
             "youtube_quota": {
@@ -716,6 +895,27 @@ class AutopilotService:
             return []
 
 
+def _source_bucket(source) -> str:
+    """Which of the six dashboard buckets this candidate belongs in.
+
+    Replaces a flat "rejected" pile with something an operator can actually
+    act on — "blocked by rights policy" and "technically unusable" call for
+    completely different fixes, and neither is the same problem as "just not
+    a great candidate this cycle".
+    """
+    if source.state in (SourceState.FILTERED, SourceState.SKIPPED):
+        if not source.policy_eligible:
+            return "POLICY_BLOCKED"
+        if not source.technical_eligible:
+            return "TECHNICALLY_INVALID"
+        return "LOW_OPPORTUNITY"
+    if source.state == SourceState.ELIGIBLE:
+        return "SHORTLISTED" if source.score >= 50 else "PROMISING_NOT_SELECTED"
+    if source.state == SourceState.DISCOVERED:
+        return "PENDING_SCORE"
+    return "ALREADY_USED"
+
+
 def _source_view(source) -> Dict[str, Any]:
     return {
         "id": source.id,
@@ -733,6 +933,12 @@ def _source_view(source) -> Dict[str, Any]:
         "definition": source.definition,
         "captions": source.caption_available,
         "discovery_source": source.discovery_source,
+        "discovery_lane": source.discovery_lane,
+        "age_cohort": source.age_cohort,
+        "selection_tier": source.selection_tier,
+        "technical_eligible": source.technical_eligible,
+        "policy_eligible": source.policy_eligible,
+        "bucket": _source_bucket(source),
         "discovered_at": source.discovered_at,
         "score": source.score,
         "score_breakdown": source.score_breakdown,

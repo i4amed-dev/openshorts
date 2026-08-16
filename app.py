@@ -1117,8 +1117,77 @@ async def _autopilot_list_profiles():
     return await publishing_service.list_profiles(api_key)
 
 
+async def _autopilot_semantic_evaluate(candidates: list) -> dict:
+    """Optional Gemini shortlist refinement for Autopilot discovery.
+
+    Called with at most ``discovery.semantic_shortlist_size`` already-ranked
+    candidates (never every raw discovery result — see
+    automation/discovery.py's refine_with_semantics), one batched call, low
+    temperature, structured JSON. A metadata-only judgement (title +
+    description, no video download) — cheap enough to run every discovery
+    cycle, cached forever per video id by the caller so an evergreen source
+    that resurfaces never pays for this twice.
+    """
+    if not candidates:
+        return {}
+    from google import genai
+    from google.genai import types
+    from pydantic import BaseModel
+
+    class SemanticJudgement(BaseModel):
+        video_id: str
+        clipability_score: float
+        hook_potential: float
+        standalone_moment_probability: float
+        overall_score: float
+
+    class SemanticShortlist(BaseModel):
+        judgements: list[SemanticJudgement]
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return {}
+    model_name = (os.environ.get("GEMINI_MODEL_AUTOPILOT")
+                 or os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite")
+    listing = "\n".join(
+        f"- id={c['video_id']} | title={c.get('title', '')!r} | "
+        f"description={(c.get('description') or '')[:300]!r}"
+        for c in candidates)
+    prompt = f"""You are scoring YouTube videos as SOURCE MATERIAL for short-form
+clips (TikTok/Reels/Shorts), from metadata only — you have not watched them.
+
+For each video below, estimate (0.0-1.0):
+- clipability_score: likely to contain a standalone 20-60s moment
+- hook_potential: title/premise creates curiosity or a strong hook
+- standalone_moment_probability: a clip would make sense without the rest
+- overall_score: your overall judgement of source quality for Shorts
+
+Videos:
+{listing}
+
+Return one judgement per video id, in the same order."""
+    try:
+        response = await asyncio.to_thread(
+            genai.Client(api_key=api_key).models.generate_content,
+            model=model_name, contents=[prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=SemanticShortlist, temperature=0.1))
+        parsed = getattr(response, "parsed", None)
+        if parsed is None:
+            parsed = SemanticShortlist.model_validate_json(response.text)
+        return {j.video_id: {"clipability_score": j.clipability_score,
+                             "hook_potential": j.hook_potential,
+                             "standalone_moment_probability": j.standalone_moment_probability,
+                             "overall_score": j.overall_score}
+               for j in parsed.judgements}
+    except Exception as exc:
+        print(f"⚠️ Autopilot semantic shortlist evaluation skipped: {exc}")
+        return {}
+
+
 def _autopilot_register_ports():
-    from automation.ports import ClipGeneratorPort, PublisherPort, register
+    from automation.ports import ClipGeneratorPort, PublisherPort, SemanticEvaluatorPort, register
     register(
         clip_generator=ClipGeneratorPort(
             submit_url=_autopilot_submit_url,
@@ -1132,6 +1201,8 @@ def _autopilot_register_ports():
             credentials=_autopilot_credentials,
             list_profiles=_autopilot_list_profiles,
         ),
+        semantic_evaluator=SemanticEvaluatorPort(
+            evaluate=_autopilot_semantic_evaluate, model_version="v1"),
     )
 
 

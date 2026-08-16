@@ -103,6 +103,68 @@ export function explainReason(reason) {
     return REASONS[reason] || reason.replace(/_/g, ' ');
 }
 
+// Six candidate buckets replacing a flat "rejected" pile — see
+// automation/service.py's _source_bucket. Each names a different fix.
+export const BUCKET_LABEL = {
+    SHORTLISTED: 'Shortlisted',
+    PROMISING_NOT_SELECTED: 'Promising, not selected yet',
+    POLICY_BLOCKED: 'Blocked by rights policy',
+    TECHNICALLY_INVALID: 'Technically unusable',
+    ALREADY_USED: 'Already used',
+    LOW_OPPORTUNITY: 'Low opportunity',
+    PENDING_SCORE: 'Just discovered',
+};
+
+export const BUCKET_TONE = {
+    SHORTLISTED: 'brass',
+    PROMISING_NOT_SELECTED: 'muted',
+    POLICY_BLOCKED: 'warn',
+    TECHNICALLY_INVALID: 'muted',
+    ALREADY_USED: 'ok',
+    LOW_OPPORTUNITY: 'muted',
+    PENDING_SCORE: 'muted',
+};
+
+export function bucketLabel(bucket) {
+    return BUCKET_LABEL[bucket] || (bucket || '').replace(/_/g, ' ').toLowerCase();
+}
+
+// Discovery lanes — see automation/config.py's LANES.
+export const LANE_LABEL = {
+    TRENDING_NOW: 'Trending now',
+    EARLY_BREAKOUT: 'Early breakout',
+    NICHE_MOMENTUM: 'Niche momentum',
+    EVERGREEN_WINNERS: 'Evergreen winners',
+    UNDEREXPOSED: 'Underexposed / high engagement',
+    CHANNEL_WINNERS: 'Channel winners',
+};
+
+export function laneLabel(lane) {
+    return LANE_LABEL[lane] || (lane || 'unknown').replace(/_/g, ' ').toLowerCase();
+}
+
+// Age cohorts — see automation/opportunity.py.
+export const AGE_COHORT_LABEL = {
+    ULTRA_FRESH: 'Ultra fresh (0-6h)',
+    FRESH: 'Fresh (6-24h)',
+    RISING: 'Rising (1-7d)',
+    RECENT: 'Recent (7-30d)',
+    ESTABLISHED: 'Established (1-12mo)',
+    EVERGREEN: 'Evergreen (1-5y)',
+    ARCHIVE: 'Archive (5y+)',
+};
+
+export function ageCohortLabel(cohort) {
+    return AGE_COHORT_LABEL[cohort] || (cohort || 'unknown').replace(/_/g, ' ').toLowerCase();
+}
+
+export function selectionTierLabel(tier) {
+    if (!tier) return '';
+    if (tier === 'EXPLORATION_PICK') return 'exploration pick';
+    if (tier === 'MANUAL') return 'picked by operator';
+    return tier.toLowerCase();
+}
+
 export const STATE_TONE = {
     DISCOVERED: 'muted', ELIGIBLE: 'brass', SELECTED: 'brass',
     PROCESS_QUEUED: 'brass', PROCESSING: 'brass', PROCESS_READY: 'brass',

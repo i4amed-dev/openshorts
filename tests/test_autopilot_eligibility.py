@@ -87,6 +87,16 @@ class TestAvailabilityFilters:
 
 
 class TestShapeFilters:
+    """Duration/captions are the only "shape" checks left as hard gates —
+    they are genuine processability, not a preference. Age, definition,
+    views, velocity, engagement and channel cooldown moved to
+    ``automation.opportunity`` as scoring inputs (see
+    ``tests/test_autopilot_opportunity.py``): none of them says a video is
+    *unusable*, only that it might not be a great source, and treating them
+    as hard gates was what emptied the candidate pool. See eligibility.py's
+    module docstring.
+    """
+
     def test_a_short_is_too_short(self):
         record = make_record("vid00000001", duration_seconds=45, now=NOW)
         assert check_eligibility(record, base_config(), now=NOW) == (False, Reason.TOO_SHORT)
@@ -95,19 +105,18 @@ class TestShapeFilters:
         record = make_record("vid00000001", duration_seconds=6 * 3600, now=NOW)
         assert check_eligibility(record, base_config(), now=NOW) == (False, Reason.TOO_LONG)
 
-    def test_an_old_video_falls_out_of_the_window(self):
+    def test_an_old_video_is_not_rejected_for_being_old(self):
         record = make_record("vid00000001", published_at=NOW - timedelta(days=30), now=NOW)
-        assert check_eligibility(record, base_config(), now=NOW) == (False, Reason.TOO_OLD)
+        assert check_eligibility(record, base_config(), now=NOW) == (True, None)
 
-    def test_sd_is_rejected_when_hd_is_required(self):
-        record = make_record("vid00000001", definition="sd", now=NOW)
-        assert check_eligibility(record, base_config(), now=NOW) == (
-            False, Reason.LOW_DEFINITION)
+    def test_a_five_year_old_video_is_not_rejected_for_being_old(self):
+        record = make_record("vid00000001", published_at=NOW - timedelta(days=365 * 5 + 30),
+                             now=NOW)
+        assert check_eligibility(record, base_config(), now=NOW) == (True, None)
 
-    def test_sd_is_accepted_when_the_floor_is_lowered(self):
-        config = base_config(eligibility={"min_definition": "any"})
+    def test_sd_is_not_rejected_even_when_hd_is_the_preference(self):
         record = make_record("vid00000001", definition="sd", now=NOW)
-        assert check_eligibility(record, config, now=NOW) == (True, None)
+        assert check_eligibility(record, base_config(), now=NOW) == (True, None)
 
     def test_captions_can_be_required(self):
         config = base_config(eligibility={"require_captions": True})
@@ -115,27 +124,30 @@ class TestShapeFilters:
         assert check_eligibility(record, config, now=NOW) == (False, Reason.NO_CAPTIONS)
 
 
-class TestTractionFilters:
-    def test_view_floor(self):
+class TestTractionIsNoLongerAGate:
+    """Views, velocity and engagement rank candidates now; they never make
+    the candidate pool empty. See test_autopilot_opportunity.py.
+    """
+
+    def test_a_low_view_count_is_not_rejected(self):
         config = base_config(eligibility={"min_views": 50_000})
         record = make_record("vid00000001", view_count=1_000, now=NOW)
-        assert check_eligibility(record, config, now=NOW) == (False, Reason.LOW_VIEWS)
+        assert check_eligibility(record, config, now=NOW) == (True, None)
 
-    def test_velocity_floor_catches_a_slow_burner(self):
-        # 5M views accumulated over 300 days is not "trending" — it is inside
-        # the age window but its velocity gives it away.
-        config = base_config(eligibility={"min_view_velocity_per_hour": 1000,
-                                          "max_age_hours": 24 * 365})
+    def test_a_slow_burner_is_not_rejected(self):
+        # 5M views accumulated over 300 days is a lifetime average, not
+        # current momentum — but it is not disqualifying either.
+        config = base_config(eligibility={"min_view_velocity_per_hour": 1000})
         record = make_record("vid00000001", view_count=5_000_000,
                              published_at=NOW - timedelta(days=300), now=NOW)
         assert record.views_per_hour(NOW) < 1000
-        assert check_eligibility(record, config, now=NOW) == (False, Reason.LOW_VELOCITY)
+        assert check_eligibility(record, config, now=NOW) == (True, None)
 
-    def test_engagement_floor(self):
+    def test_low_engagement_is_not_rejected(self):
         config = base_config(eligibility={"min_engagement_rate": 0.05})
         record = make_record("vid00000001", view_count=1_000_000, like_count=10,
                              comment_count=1, now=NOW)
-        assert check_eligibility(record, config, now=NOW) == (False, Reason.LOW_ENGAGEMENT)
+        assert check_eligibility(record, config, now=NOW) == (True, None)
 
 
 class TestChannelPolicy:
@@ -150,18 +162,17 @@ class TestChannelPolicy:
         assert check_eligibility(record, config, now=NOW) == (
             False, Reason.CHANNEL_NOT_ALLOWED)
 
-    def test_cooldown_blocks_a_recently_used_channel(self):
+    def test_a_recently_used_channel_is_not_hard_rejected(self):
+        # Cooldown is a soft ranking penalty and a selection-time deferral
+        # now (see opportunity.py's channel_recent penalty and
+        # discovery.pick_next_source), not a hard eligibility gate — an
+        # operator relaxing the cooldown must not have to wait for the
+        # candidate to be re-discovered from scratch.
         config = base_config(eligibility={"channel_cooldown_hours": 168})
         record = make_record("vid00000001", now=NOW)
         recent = NOW - timedelta(hours=10)
         assert check_eligibility(record, config, now=NOW, channel_last_used=recent) == (
-            False, Reason.CHANNEL_COOLDOWN)
-
-    def test_cooldown_expires(self):
-        config = base_config(eligibility={"channel_cooldown_hours": 168})
-        record = make_record("vid00000001", now=NOW)
-        old = NOW - timedelta(days=30)
-        assert check_eligibility(record, config, now=NOW, channel_last_used=old) == (True, None)
+            True, None)
 
 
 class TestKeywordFilters:

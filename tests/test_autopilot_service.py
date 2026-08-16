@@ -239,6 +239,48 @@ class TestOperatorActions:
         assert result["ok"] is False
         assert "already processing" in result["reason"]
 
+    def test_process_source_starts_a_specific_candidate_out_of_score_order(self, service):
+        """The point of `process_source`: an operator can pick a candidate the
+        ranking did not put first, and it still goes through the exact same
+        submission path (state transitions, job claim) as the automatic one."""
+        enable(service)
+        run_async(service.orchestrator.run_discovery(now=NOW, force=True))
+        eligible = service.db.list_sources(states=[SourceState.ELIGIBLE], limit=10)
+        assert len(eligible) >= 2
+        chosen = eligible[-1]  # deliberately not the top-ranked one
+
+        result = run_async(service.process_source(chosen.id))
+        assert result["ok"] is True
+
+        refreshed = service.db.get_source(chosen.id)
+        assert refreshed.state == SourceState.PROCESS_QUEUED
+        assert refreshed.job_id
+
+    def test_process_source_gives_a_real_reason_for_an_ineligible_candidate(self, service):
+        enable(service)
+        run_async(service.orchestrator.run_discovery(now=NOW, force=True))
+        eligible = service.db.list_sources(states=[SourceState.ELIGIBLE], limit=1)[0]
+        service.skip_source(eligible.id)
+
+        result = run_async(service.process_source(eligible.id))
+        assert result["ok"] is False
+        assert "skipped" in result["reason"].lower()
+
+    def test_process_source_rejects_an_unknown_id(self, service):
+        result = run_async(service.process_source(999999))
+        assert result["ok"] is False
+        assert "not found" in result["reason"].lower()
+
+    def test_process_source_refuses_while_something_else_is_running(self, service):
+        enable(service)
+        run_async(service.orchestrator.run_discovery(now=NOW, force=True))
+        eligible = service.db.list_sources(states=[SourceState.ELIGIBLE], limit=10)
+        assert run_async(service.process_source(eligible[0].id))["ok"] is True
+
+        result = run_async(service.process_source(eligible[1].id))
+        assert result["ok"] is False
+        assert "already processing" in result["reason"].lower()
+
 
 class TestStatusView:
     def test_answers_the_questions_an_operator_returns_with(self, service):
@@ -274,6 +316,45 @@ class TestStatusView:
         assert candidate["score"] > 0
         assert candidate["score_breakdown"]["components"]
         assert candidate["score_breakdown"]["contributions"]
+
+    def test_the_discovery_funnel_explains_the_last_run(self, service):
+        enable(service)
+        service.youtube.records = [
+            make_record("vid00000001", now=NOW, license="youtube"),
+            make_record("vid00000002", now=NOW),
+        ]
+        run_async(service.orchestrator.run_discovery(now=NOW, force=True))
+        funnel = service.status(now=NOW)["discovery_funnel"]
+        assert funnel["fetched"] == 2
+        assert funnel["eligible"] == 1
+        assert funnel["rejected"] == 1
+        assert "rights_policy" in funnel["rejection_reasons"]
+        assert funnel["lanes_run"]
+
+    def test_each_candidate_carries_a_dashboard_bucket(self, service):
+        enable(service)
+        service.youtube.records = [
+            make_record("vid00000001", now=NOW, license="youtube"),
+            make_record("vid00000002", now=NOW),
+        ]
+        run_async(service.orchestrator.run_discovery(now=NOW, force=True))
+        status = service.status(now=NOW)
+        assert status["queue"][0]["bucket"] in ("SHORTLISTED", "PROMISING_NOT_SELECTED")
+        assert status["rejected"][0]["bucket"] == "POLICY_BLOCKED"
+
+    def test_a_selection_diagnostic_appears_when_nothing_was_selected(self, service):
+        enable(service)
+        service.youtube.records = [make_record("vid00000001", now=NOW, license="youtube")]
+        run_async(service.orchestrator.run_discovery(now=NOW, force=True))
+        status = service.status(now=NOW)
+        assert status["selection_diagnostic"] is not None
+        assert status["selection_diagnostic"]["bottleneck"] == "rights_policy"
+
+    def test_no_selection_diagnostic_once_something_has_been_selected(self, service):
+        enable(service)
+        _run_to_scheduled(service)
+        status = service.status(now=NOW)
+        assert status["selection_diagnostic"] is None
 
     def test_slots_are_reported_in_local_time_as_well_as_utc(self, service):
         enable(service)
@@ -359,6 +440,28 @@ class TestRetentionIntegration:
             service.db.set_publish_state(attempt.id, PublishState.IN_FLIGHT)
             service.db.set_publish_state(attempt.id, PublishState.SUBMITTED)
         assert service.files_in_use() == []
+
+
+class TestDryRun:
+    """Discover, score, and preview the pick — never submit or publish."""
+
+    def test_a_dry_run_discovers_and_shows_what_would_be_selected(self, service):
+        enable(service)
+        result = run_async(service.discover_dry_run())
+        assert result["discovery"]["ok"] is True
+        assert result["would_select"] is not None
+        assert result["selection_tier"] in ("STRICT", "NORMAL", "EXPLORATION",
+                                            "EXPLORATION_PICK")
+        assert service.clip_gen.submissions == []          # nothing was submitted
+        assert service.publisher.calls == []                # nothing was published
+
+    def test_a_dry_run_explains_why_nothing_would_be_selected(self, service):
+        enable(service)
+        service.youtube.records = [make_record("vid00000001", now=NOW, license="youtube")]
+        result = run_async(service.discover_dry_run())
+        assert result["would_select"] is None
+        assert result["diagnostic"]["bottleneck"] == "rights_policy"
+        assert service.clip_gen.submissions == []
 
 
 def _submitted_attempt(service, *, hours_ahead=6, now=NOW):

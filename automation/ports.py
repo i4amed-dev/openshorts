@@ -64,9 +64,28 @@ class PublisherPort:
 
 
 @dataclass
+class SemanticEvaluatorPort:
+    """Optional Gemini shortlist refinement (automation/opportunity.py's
+    ``semantic`` component).
+
+    Deliberately optional and narrow: called with at most
+    ``discovery.semantic_shortlist_size`` already-ranked candidates (never
+    every raw discovery result), and only for the shortlist a discovery run
+    is about to store. ``evaluate`` takes a list of ``{video_id, title,
+    description}`` dicts and returns ``{video_id: {clipability_score,
+    hook_potential, standalone_moment_probability, overall_score}}`` — any
+    video id absent from the result is simply treated as "no semantic
+    refinement available" rather than an error.
+    """
+    evaluate: Callable[[List[Dict[str, Any]]], Awaitable[Dict[str, Dict[str, float]]]]
+    model_version: str = "v1"
+
+
+@dataclass
 class Runtime:
     clip_generator: Optional[ClipGeneratorPort] = None
     publisher: Optional[PublisherPort] = None
+    semantic_evaluator: Optional[SemanticEvaluatorPort] = None
 
     @property
     def ready(self) -> bool:
@@ -77,11 +96,14 @@ _runtime = Runtime()
 
 
 def register(clip_generator: Optional[ClipGeneratorPort] = None,
-             publisher: Optional[PublisherPort] = None) -> Runtime:
+             publisher: Optional[PublisherPort] = None,
+             semantic_evaluator: Optional[SemanticEvaluatorPort] = None) -> Runtime:
     if clip_generator is not None:
         _runtime.clip_generator = clip_generator
     if publisher is not None:
         _runtime.publisher = publisher
+    if semantic_evaluator is not None:
+        _runtime.semantic_evaluator = semantic_evaluator
     return _runtime
 
 
@@ -93,3 +115,4 @@ def reset() -> None:
     """Drop the registered adapters (tests install fakes through `register`)."""
     _runtime.clip_generator = None
     _runtime.publisher = None
+    _runtime.semantic_evaluator = None

@@ -196,16 +196,19 @@ class Orchestrator:
 
     # --- source selection + submission ---------------------------------------
 
+    def _daily_capacity_ok(self, config: Dict[str, Any], now: datetime) -> bool:
+        day_start, _day_end = scheduler.local_day_bounds(config, now=now)
+        used_today = self.db.sources_selected_since(day_start)
+        max_sources = int((config.get("schedule") or {}).get("max_sources_per_day", 1))
+        return used_today < max_sources
+
     async def _start_next_source(self, config: Dict[str, Any], *, now: datetime) -> bool:
         cg = self.runtime.clip_generator
         if cg is None:
             return False
 
         # Daily source cap, counted in the operator's local day.
-        day_start, day_end = scheduler.local_day_bounds(config, now=now)
-        used_today = self.db.sources_selected_since(day_start)
-        max_sources = int((config.get("schedule") or {}).get("max_sources_per_day", 1))
-        if used_today >= max_sources:
+        if not self._daily_capacity_ok(config, now):
             return False
 
         # Belt and braces on top of the DB check: never start a second heavy
@@ -216,13 +219,68 @@ class Orchestrator:
         except Exception:
             pass
 
-        source, _reason = discovery.pick_next_source(self.db, config, now=now)
+        source, tier_or_reason = discovery.pick_next_source(self.db, config, now=now)
         if source is None:
+            diagnostic = discovery.explain_empty_selection(self.db, config)
+            self.db.log_event("selection", diagnostic.get("message", "No source selected"),
+                              level="info", data=diagnostic)
             return False
 
+        return await self._submit_source(source, config, now=now, selection_tier=tier_or_reason)
+
+    async def start_specific_source(self, source_id: int, config: Dict[str, Any], *,
+                                     now: datetime) -> tuple[bool, str]:
+        """Process THIS candidate now, out of score order — the operator picked
+        it in Telegram or the dashboard rather than letting the ranking decide.
+
+        Runs every validation the automatic path runs (state, daily capacity,
+        one-heavy-job-at-a-time, quality gate, rights) so an operator's choice
+        can never force an illegal transition; on failure the reason is
+        returned rather than a bare bool, so the caller can tell the operator
+        *why* instead of just "no".
+        """
+        cg = self.runtime.clip_generator
+        if cg is None:
+            return False, "The clip pipeline is not ready — restart the backend."
+
+        source = self.db.get_source(source_id)
+        if source is None:
+            return False, "Candidate not found."
+        if source.state != SourceState.ELIGIBLE:
+            return False, f"This candidate is {source.state.lower()}, not eligible to process."
+        if not self._daily_capacity_ok(config, now):
+            return False, "Today's source limit has already been reached."
+        try:
+            if cg.active_heavy_jobs() > 0:
+                return False, ("Another job is already processing — Klippo runs one heavy "
+                               "pipeline at a time.")
+        except Exception:
+            pass
+
+        ok = await self._submit_source(source, config, now=now)
+        if not ok:
+            return False, ("Could not submit this candidate — it may have just been claimed "
+                           "by a scheduled run, or submission failed. Check /errors.")
+        return True, "Submitted."
+
+    async def _submit_source(self, source: DiscoveredSource, config: Dict[str, Any], *,
+                              now: datetime, selection_tier: Optional[str] = "MANUAL") -> bool:
+        """Shared by the automatic ("next by score") and specific ("this one",
+        picked by an operator) selection paths: SELECTED transition, the
+        quality gate, submission to the Clip Generator, and claiming the job.
+
+        ``selection_tier`` records which adaptive-selection pass produced this
+        pick (STRICT/NORMAL/EXPLORATION/EXPLORATION_PICK) — absent for an
+        operator's manual pick via start_specific_source, which bypasses
+        ranking entirely by design.
+        """
+        cg = self.runtime.clip_generator
+        assert cg is not None
+
         if not self.db.transition_source(source.id, SourceState.SELECTED,
-                                         expected=[SourceState.ELIGIBLE]):
-            return False  # another tick took it
+                                         expected=[SourceState.ELIGIBLE],
+                                         selection_tier=selection_tier):
+            return False  # another tick (or another operator action) took it
 
         # Quality gate. Autopilot must never enter the interactive confirmation
         # flow the manual UI uses, so a low-quality source is skipped with a

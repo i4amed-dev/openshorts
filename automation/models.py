@@ -180,6 +180,18 @@ class EngineStatus:
 
 # Machine-readable reasons a candidate was rejected. The dashboard renders these
 # verbatim, so they double as the operator's explanation of *why*.
+#
+# TOO_OLD / LOW_VIEWS / LOW_VELOCITY / LOW_ENGAGEMENT / LOW_DEFINITION /
+# CHANNEL_COOLDOWN are no longer produced by automation.eligibility — age,
+# views, velocity, engagement, definition and channel recency are scoring
+# inputs in automation.opportunity now, not hard gates. The values stay
+# defined because they remain meaningful as historical/legacy data on rows
+# written before this change, and CHANNEL_COOLDOWN/TOO_OLD/LOW_DEFINITION are
+# still used as *soft* signals elsewhere (selection-time channel deferral,
+# score penalties). LOW_OPPORTUNITY is new: it is what selection reports when
+# a candidate is technically valid and rights-clear but its opportunity score
+# never cleared even the exploration floor (see automation.discovery's
+# adaptive selection tiers).
 class Reason:
     DUPLICATE = "duplicate_source"
     TOO_SHORT = "duration_below_minimum"
@@ -204,6 +216,8 @@ class Reason:
     QUALITY_GATE = "source_quality_below_minimum"
     NO_CLIPS = "no_clips_generated"
     DAILY_SOURCE_LIMIT = "daily_source_limit_reached"
+    LOW_OPPORTUNITY = "opportunity_score_below_floor"
+    NO_ELIGIBLE_SOURCE = "no_eligible_source"
 
 
 @dataclass
@@ -230,11 +244,11 @@ class DiscoveredSource:
     age_restricted: bool = False
     privacy_status: str = "public"
     embeddable: bool = True
-    discovery_source: str = ""              # most_popular | niche_search:<topic>
+    discovery_source: str = ""              # most_popular | niche_search:<topic> (legacy/raw)
     discovered_at: Optional[str] = None
     chart_rank: Optional[int] = None
     run_id: Optional[str] = None
-    score: float = 0.0
+    score: float = 0.0                      # the opportunity score, 0..100
     score_breakdown: Dict[str, Any] = field(default_factory=dict)
     eligible: bool = False
     rejection_reason: Optional[str] = None
@@ -246,6 +260,12 @@ class DiscoveredSource:
     last_error: Optional[str] = None
     rights_policy: Optional[str] = None
     next_retry_at: Optional[str] = None
+    # --- opportunity/discovery metadata (schema v3) ---
+    discovery_lane: Optional[str] = None    # TRENDING_NOW | EARLY_BREAKOUT | ... (canonical)
+    age_cohort: Optional[str] = None        # ULTRA_FRESH | FRESH | RISING | ... | ARCHIVE
+    selection_tier: Optional[str] = None    # STRICT | NORMAL | EXPLORATION, set at selection
+    technical_eligible: bool = True         # passed check_eligibility (technical validity)
+    policy_eligible: bool = True            # passed check_rights — independent of the score
 
     @property
     def watch_url(self) -> str:

@@ -1,14 +1,21 @@
 import React, { useState } from 'react';
 import {
-    Activity, AlertTriangle, Calendar, CheckCircle2, ChevronDown, ChevronRight,
+    Activity, AlertTriangle, Beaker, Calendar, CheckCircle2, ChevronDown, ChevronRight,
     Circle, Clock, ExternalLink, HardDrive, Loader2, Pause, Play, Power,
     RefreshCw, Search, SkipForward, Sparkles, XCircle, Zap,
 } from 'lucide-react';
+import DiscoveryFunnel from './DiscoveryFunnel';
 import ScoreBreakdown from './ScoreBreakdown';
 import {
-    PUBLISH_EXPLAINER, badgeClass, explainReason, fmtCount, fmtDuration, fmtInZone,
-    publishLabel, relative,
+    PUBLISH_EXPLAINER, ageCohortLabel, badgeClass, bucketLabel, BUCKET_TONE,
+    explainReason, fmtCount, fmtDuration, fmtInZone, laneLabel, publishLabel, relative,
+    selectionTierLabel,
 } from './format';
+
+// Grouping order for the "not used" section — most actionable first.
+const BUCKET_ORDER = [
+    'POLICY_BLOCKED', 'TECHNICALLY_INVALID', 'LOW_OPPORTUNITY', 'PROMISING_NOT_SELECTED',
+];
 
 /**
  * The Autopilot operations view.
@@ -62,15 +69,31 @@ function SourceRow({ source, onSkip, onRetry, busy }) {
                         <span className={badgeClass(source.state)}>
                             {source.state.replace(/_/g, ' ').toLowerCase()}
                         </span>
+                        {source.bucket && (
+                            <span className={`badge-${BUCKET_TONE[source.bucket] || 'muted'}`}>
+                                {bucketLabel(source.bucket)}
+                            </span>
+                        )}
                     </div>
                     <div className="flex items-center gap-3 mt-1 flex-wrap">
                         <span className="readout">{source.channel || 'unknown channel'}</span>
                         <span className="readout">{fmtCount(source.views)} views</span>
                         <span className="readout">{fmtDuration(source.duration_seconds)}</span>
+                        {source.discovery_lane && (
+                            <span className="readout">{laneLabel(source.discovery_lane)}</span>
+                        )}
+                        {source.age_cohort && (
+                            <span className="readout">{ageCohortLabel(source.age_cohort)}</span>
+                        )}
                         {source.license === 'creativeCommon' && (
                             <span className="readout text-ok">creative commons</span>
                         )}
-                        {source.rejection_reason && (
+                        {!source.policy_eligible && (
+                            <span className="readout text-warn">
+                                {explainReason(source.rejection_reason)}
+                            </span>
+                        )}
+                        {source.policy_eligible && !source.technical_eligible && (
                             <span className="readout text-warn">
                                 {explainReason(source.rejection_reason)}
                             </span>
@@ -85,7 +108,9 @@ function SourceRow({ source, onSkip, onRetry, busy }) {
 
                 <div className="shrink-0 text-right">
                     <p className="font-mono text-sm text-brass">{source.score?.toFixed(1)}</p>
-                    <p className="readout">score</p>
+                    <p className="readout">
+                        {source.selection_tier ? selectionTierLabel(source.selection_tier) : 'score'}
+                    </p>
                 </div>
             </div>
 
@@ -101,6 +126,10 @@ function SourceRow({ source, onSkip, onRetry, busy }) {
                                 policy: {source.rights_policy.replace(/_/g, ' ').toLowerCase()}
                             </span>
                         )}
+                        <span className="readout">
+                            rights {source.policy_eligible ? 'ok' : 'blocked'} · technical{' '}
+                            {source.technical_eligible ? 'ok' : 'invalid'}
+                        </span>
                         {source.job_id && (
                             <span className="readout">job {source.job_id.slice(0, 8)}</span>
                         )}
@@ -309,9 +338,10 @@ function PublishRow({ attempt, timezone, onRetry, onForceRetry, onResolve, onAba
 }
 
 
-export default function AutopilotOps({ status, busy, action, onOpenSetup }) {
+export default function AutopilotOps({ status, busy, action, onOpenSetup, onDryRun }) {
     const [confirm, setConfirm] = useState(null);
     const [showRejected, setShowRejected] = useState(false);
+    const [dryRun, setDryRun] = useState(null); // { loading, result, error }
 
     if (!status) {
         return (
@@ -335,6 +365,16 @@ export default function AutopilotOps({ status, busy, action, onOpenSetup }) {
 
     const run = (name, args) => action(name, args);
     const confirmThen = (message, name, args) => setConfirm({ message, name, args });
+
+    const runDryRun = async () => {
+        if (!onDryRun) return;
+        setDryRun({ loading: true });
+        try {
+            setDryRun({ loading: false, result: await onDryRun() });
+        } catch (e) {
+            setDryRun({ loading: false, error: e.detail || 'The dry run failed.' });
+        }
+    };
 
     return (
         <div className="space-y-6">
@@ -451,6 +491,15 @@ export default function AutopilotOps({ status, busy, action, onOpenSetup }) {
                     className="btn-quiet px-3 py-2 text-xs">
                     <Zap size={13} /> process next candidate
                 </button>
+                {onDryRun && (
+                    <button onClick={runDryRun} disabled={busy || dryRun?.loading}
+                        className="btn-quiet px-3 py-2 text-xs">
+                        {dryRun?.loading
+                            ? <Loader2 size={13} className="animate-spin" />
+                            : <Beaker size={13} />}
+                        run discovery test
+                    </button>
+                )}
                 <div className="flex-1" />
                 <button
                     onClick={() => confirmThen(
@@ -464,6 +513,36 @@ export default function AutopilotOps({ status, busy, action, onOpenSetup }) {
                     <AlertTriangle size={13} /> emergency stop
                 </button>
             </div>
+
+            {/* --- Dry-run result ----------------------------------------------- */}
+            {dryRun && !dryRun.loading && (
+                <div className="card p-4 border-brass/30">
+                    <div className="flex items-center gap-2 mb-2">
+                        <Beaker size={14} className="text-brass" />
+                        <p className="text-sm text-ink">discovery test result</p>
+                        <button onClick={() => setDryRun(null)}
+                            className="readout ml-auto hover:text-ink">dismiss</button>
+                    </div>
+                    {dryRun.error && <p className="text-xs text-danger">{dryRun.error}</p>}
+                    {dryRun.result && dryRun.result.would_select ? (
+                        <div>
+                            <p className="text-xs text-ink2 mb-2">
+                                Would select ({selectionTierLabel(dryRun.result.selection_tier)}) —
+                                nothing was submitted or published.
+                            </p>
+                            <SourceRow source={dryRun.result.would_select} busy={busy} />
+                        </div>
+                    ) : dryRun.result ? (
+                        <p className="text-xs text-ink2 leading-relaxed">
+                            Nothing would be selected right now.{' '}
+                            {dryRun.result.diagnostic?.message}
+                        </p>
+                    ) : null}
+                </div>
+            )}
+
+            {/* --- Discovery funnel --------------------------------------------- */}
+            <DiscoveryFunnel funnel={status.discovery_funnel} diagnostic={status.selection_diagnostic} />
 
             {/* --- Scheduled posts -------------------------------------------- */}
             <section className="card p-5">
@@ -552,10 +631,24 @@ export default function AutopilotOps({ status, busy, action, onOpenSetup }) {
                     <span className="readout ml-auto">{status.rejected?.length || 0}</span>
                 </button>
                 {showRejected && (
-                    <div className="mt-3">
-                        {status.rejected?.length ? status.rejected.map((source) => (
-                            <SourceRow key={source.id} source={source} busy={busy} />
-                        )) : (
+                    <div className="mt-3 space-y-5">
+                        {status.rejected?.length ? BUCKET_ORDER.map((bucket) => {
+                            const items = status.rejected.filter((s) => s.bucket === bucket);
+                            if (!items.length) return null;
+                            return (
+                                <div key={bucket}>
+                                    <div className="flex items-center gap-2 mb-1">
+                                        <span className={`badge-${BUCKET_TONE[bucket] || 'muted'}`}>
+                                            {bucketLabel(bucket)}
+                                        </span>
+                                        <span className="readout">{items.length}</span>
+                                    </div>
+                                    {items.map((source) => (
+                                        <SourceRow key={source.id} source={source} busy={busy} />
+                                    ))}
+                                </div>
+                            );
+                        }) : (
                             <p className="text-xs text-muted">Nothing rejected yet.</p>
                         )}
                     </div>

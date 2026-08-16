@@ -57,6 +57,7 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 | `translate.py` | ElevenLabs dubbing API for AI voice translation |
 | `publishing_service.py` | **The one** Upload-Post implementation — payload construction, streaming multipart upload, status reconciliation, scheduled-job listing/cancellation. Used by `/api/social/post`, `/api/saasshorts/post`, `/api/thumbnail/publish` and Autopilot. No other module may speak HTTP to Upload-Post. |
 | `automation/` | Autopilot: the unattended content engine (see below) |
+| `telegram_bot/` | Mobile control center — Telegram bot for Autopilot + manual Clip Generator (see below) |
 | `ops/healthcheck.py` | Machine fitness check for a dedicated Autopilot Mac |
 | `ops/benchmark.py` | Memory/CPU/disk cost of one real source on this machine |
 | `dashboard/src/App.jsx` | Main React component with state management |
@@ -117,6 +118,43 @@ lease, dashboard view), `api.py`, `ports.py` (the seam to `app.py`).
 
 Ops: `ops/macos/` for always-on macOS setup. `ops/healthcheck.py` and
 `ops/benchmark.py` for the M1 deployment profile.
+
+### Telegram bot (`telegram_bot/`)
+
+The mobile control surface: candidate explorer, manual URL/upload submission,
+job/clip browsing, the honest publishing lifecycle, guided settings, and
+notifications — all from a phone, without the dashboard. Runs as an asyncio
+task inside the same process as FastAPI (`app.py`'s lifespan starts/stops
+it); disabled entirely when `TELEGRAM_BOT_TOKEN` is unset, and a bot failure
+never takes the backend down with it.
+
+Rules that matter:
+
+- **Fails closed.** No `TELEGRAM_ADMIN_USER_IDS` configured means nobody gets
+  anything — not even read access. See `auth.py`.
+- **No second pipeline, no HTTP loopback.** Video submission goes through
+  `app.submit_clip_job()` (the same function `/api/process` calls) or the
+  `automation.ports.ClipGeneratorPort` seam Autopilot already uses. Publishing
+  reuses `AutopilotService` methods and `automation/publishing.py`'s
+  reservation building blocks — Telegram never talks to Upload-Post directly.
+- **Handlers never touch `automation.db` SQL.** They call `service.*` methods
+  or read-only `service.db.*` repository methods, same as `automation/api.py`.
+- **Its own SQLite tables** (`telegram_chat`, `telegram_preferences`,
+  `telegram_event_cursor`, `telegram_action_log`) live in the *same* database
+  file Autopilot uses (WAL mode; separate connection), via `persistence.py` —
+  `automation/` still never imports anything Telegram-related.
+- **Callback data is attacker-controlled input.** Routed through a structured
+  `ns:action:args` namespace (`callbacks.py`) with a single answer-once policy;
+  unknown/forged callbacks degrade safely, never crash.
+
+Files: `app.py` (Application lifecycle), `auth.py` (roles), `render.py` (HTML
+rendering, one system), `callbacks.py` (routing), `errors.py` (delivery
+fallback chain + the Application error handler), `navigation.py` /
+`keyboards.py` (pagination, shared keyboards), `persistence.py`,
+`notifications.py` (poll/digest jobs), `handlers/` (one module per screen).
+`check.py` / `send_test.py` are safe, human-run diagnostics —
+`python -m telegram_bot.check` (read-only) and
+`python -m telegram_bot.send_test --chat-id …` (sends exactly one message).
 
 
 ### SEO / AI-crawler surface
@@ -181,6 +219,11 @@ Async job queue with semaphore-based concurrency control. Configure via `MAX_CON
 - `GEMINI_API_KEY`, `YOUTUBE_DATA_API_KEY`, `UPLOAD_POST_API_KEY`, `UPLOAD_POST_USER` -
   required by Autopilot, which cannot read the browser's localStorage
 - `AUTOPILOT_ENABLED`, `AUTOPILOT_DB_PATH`, `AUTOPILOT_TICK_SECONDS`, `AUTOPILOT_LEASE_TTL`
+- `TELEGRAM_BOT_TOKEN` - enables the Telegram bot (unset = disabled entirely)
+- `TELEGRAM_ADMIN_USER_IDS`, `TELEGRAM_VIEWER_USER_IDS` - fail-closed role config;
+  no admin id means nobody gets any access
+- `TELEGRAM_ALLOWED_CHAT_IDS` - destination policy only, not a privilege grant
+- `TELEGRAM_DASHBOARD_URL` - optional "Open Dashboard" button (must be phone-reachable, never localhost)
 
 **Client-side (localStorage, encrypted):**
 - `GEMINI_API_KEY` - Google Gemini API key (required)
@@ -190,7 +233,7 @@ Async job queue with semaphore-based concurrency control. Configure via `MAX_CON
 > API keys are stored encrypted in the browser and sent via headers only when needed. Never stored server-side.
 
 ## Tech Stack
-- **Backend:** Python 3.11, FastAPI, google-genai, faster-whisper, ultralytics (YOLOv8), mediapipe, opencv-python, yt-dlp, FFmpeg, httpx
+- **Backend:** Python 3.11, FastAPI, google-genai, faster-whisper, ultralytics (YOLOv8), mediapipe, opencv-python, yt-dlp, FFmpeg, httpx, python-telegram-bot
 - **Frontend:** React 18, Vite 4, Tailwind CSS 3.4
-- **External APIs:** Google Gemini, ElevenLabs Dubbing, Upload-Post
+- **External APIs:** Google Gemini, ElevenLabs Dubbing, Upload-Post, Telegram Bot API
 - **Infrastructure:** Docker + Docker Compose, AWS S3

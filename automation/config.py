@@ -40,7 +40,46 @@ RIGHTS_POLICIES = (
 )
 
 PLATFORMS = ("tiktok", "instagram", "youtube")
+# Legacy single-strategy config, still accepted as input and mapped onto
+# ``lanes`` below — never emitted from normalise() itself. See LANES.
 DISCOVERY_STRATEGIES = ("most_popular", "niche_search")
+
+# Discovery lanes: independent ways of finding candidates, each targeting a
+# different kind of opportunity (see automation/discovery.py). A candidate
+# pool built from one lane structurally favours one kind of opportunity —
+# "trending" and "proven evergreen demand" are not the same thing, and a
+# system that only looks for one of them will only ever find one of them.
+LANE_TRENDING_NOW = "TRENDING_NOW"
+LANE_EARLY_BREAKOUT = "EARLY_BREAKOUT"
+LANE_NICHE_MOMENTUM = "NICHE_MOMENTUM"
+LANE_EVERGREEN_WINNERS = "EVERGREEN_WINNERS"
+LANE_UNDEREXPOSED = "UNDEREXPOSED"
+LANE_CHANNEL_WINNERS = "CHANNEL_WINNERS"
+LANES = (
+    LANE_TRENDING_NOW, LANE_EARLY_BREAKOUT, LANE_NICHE_MOMENTUM,
+    LANE_EVERGREEN_WINNERS, LANE_UNDEREXPOSED, LANE_CHANNEL_WINNERS,
+)
+# Lanes that need at least one configured topic to search for.
+SEARCH_LANES_REQUIRING_TOPICS = (
+    LANE_EARLY_BREAKOUT, LANE_NICHE_MOMENTUM, LANE_EVERGREEN_WINNERS, LANE_UNDEREXPOSED,
+)
+# One-time mapping so a settings document written before lanes existed keeps
+# behaving the way an operator configured it.
+_LEGACY_STRATEGY_TO_LANE = {
+    "most_popular": LANE_TRENDING_NOW,
+    "niche_search": LANE_NICHE_MOMENTUM,
+}
+
+DISCOVERY_MODE_BALANCED = "BALANCED"
+DISCOVERY_MODE_TREND_HEAVY = "TREND_HEAVY"
+DISCOVERY_MODE_EVERGREEN_HEAVY = "EVERGREEN_HEAVY"
+DISCOVERY_MODE_NICHE_FOCUSED = "NICHE_FOCUSED"
+DISCOVERY_MODE_EXPERIMENTAL = "EXPERIMENTAL"
+DISCOVERY_MODES = (
+    DISCOVERY_MODE_BALANCED, DISCOVERY_MODE_TREND_HEAVY, DISCOVERY_MODE_EVERGREEN_HEAVY,
+    DISCOVERY_MODE_NICHE_FOCUSED, DISCOVERY_MODE_EXPERIMENTAL,
+)
+
 CATCH_UP_POLICIES = ("next_slot", "skip", "immediate")
 CLIP_SELECTION_MODES = ("top_n", "all")
 DEFINITIONS = ("any", "sd", "hd")
@@ -48,36 +87,64 @@ DEFINITIONS = ("any", "sd", "hd")
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 _YT_CHANNEL_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
 
-# Ranking weights. Every component is normalised to 0..1 within the candidate
-# set before weighting, so no single raw count (a 40M-view video) can dominate.
+# A from-scratch install has no configured niche yet, but the default rights
+# policy (Creative Commons only) means the chart-based TRENDING_NOW lane
+# alone will reject almost everything on rights grounds — it structurally
+# cannot be CC-filtered (see discovery.py). Without *some* default topics,
+# the CC-filterable search lanes below have nothing to search for and the
+# candidate pool stays empty out of the box, which is the exact bug this
+# system exists to fix. These are a generic, broadly-appealing seed list an
+# operator is expected to replace with their own niche.
+DEFAULT_TOPICS: List[str] = [
+    "life advice", "true stories", "science facts", "how to", "interesting facts",
+]
+
+# Opportunity score weights. Every component is normalised to 0..1 (within a
+# cohort where age matters, see opportunity.py) before weighting, so no single
+# raw count can dominate, and each cohort's own multiplier further shifts how
+# much a given signal counts for that age of candidate.
 DEFAULT_WEIGHTS: Dict[str, float] = {
-    "velocity": 0.30,      # views per hour since publication, rank-normalised
-    "views": 0.10,         # absolute reach, log-compressed
-    "engagement": 0.20,    # (likes + comments) / views
-    "comments": 0.05,      # comment activity on its own (discussion = clippable)
-    "recency": 0.15,       # newer inside the configured age window
-    "chart_rank": 0.10,    # position in YouTube's mostPopular response
-    "relevance": 0.10,     # keyword/topic match against configured niche
-    "duration_fit": 0.05,  # sources that yield several good clips
+    "trend_momentum": 0.20,        # early velocity — fades to neutral for old cohorts
+    "engagement_quality": 0.15,    # Bayesian-smoothed like+comment rate
+    "proven_demand": 0.15,         # log(views) + engagement + comments — rewards old winners
+    "channel_outperformance": 0.10,  # candidate vs. this channel's own typical reach
+    "content_relevance": 0.10,     # keyword/topic match against configured niche
+    "shorts_suitability": 0.10,    # duration fit + hook/format heuristics
+    "evergreen_strength": 0.10,    # timeless topic + age + sustained engagement
+    "conversion_proxy": 0.05,      # AudienceConversionPotential proxy — never a subscriber count
+    "semantic": 0.05,              # optional Gemini shortlist refinement; no-op if absent
 }
 DEFAULT_PENALTIES: Dict[str, float] = {
-    "channel_repeat": 0.25,   # per prior source from the same channel (capped)
-    "previously_seen": 0.10,  # discovered before but never processed
+    "channel_repeat": 0.25,       # per prior *selected* source from the same channel (capped)
+    "previously_seen": 0.10,      # discovered before but never processed
+    "channel_recent": 0.15,       # channel used inside its cooldown window (tapers to 0)
+    "near_duplicate_title": 0.20,  # looks like another candidate already in this shortlist
 }
 
 DEFAULTS: Dict[str, Any] = {
     "enabled": False,
     "timezone": "UTC",
     "discovery": {
-        "strategies": ["most_popular"],
+        "lanes": [LANE_TRENDING_NOW, LANE_NICHE_MOMENTUM, LANE_EVERGREEN_WINNERS,
+                 LANE_CHANNEL_WINNERS],
+        "discovery_mode": DISCOVERY_MODE_BALANCED,
         "region_code": "US",
         "relevance_language": "en",
         "category_ids": [],
-        "topics": [],
+        "topics": list(DEFAULT_TOPICS),
         "max_candidates_per_run": 50,
+        "lanes_per_run": 3,
+        "query_variants_per_topic": 2,
+        "exploration_rate": 0.15,
+        "semantic_shortlist_size": 8,
         "channel_allowlist": [],
         "channel_denylist": [],
     },
+    # These used to be hard eligibility floors. They no longer reject a
+    # candidate outright (see eligibility.py / opportunity.py) — a value here
+    # now only shapes the opportunity score (e.g. how the engagement prior or
+    # the SD-quality penalty is set), so an operator's existing settings keep
+    # a similar *intent* without silently emptying the candidate pool.
     "eligibility": {
         "min_duration_seconds": 180,
         "max_duration_seconds": 5400,
@@ -100,6 +167,14 @@ DEFAULTS: Dict[str, Any] = {
     "ranking": {
         "weights": dict(DEFAULT_WEIGHTS),
         "penalties": dict(DEFAULT_PENALTIES),
+    },
+    # Adaptive selection: three passes over the same ELIGIBLE queue, each
+    # relaxing how good the opportunity score must be — never relaxing rights
+    # or technical validity. See discovery.pick_next_source.
+    "selection": {
+        "strict_floor": 70.0,
+        "normal_floor": 45.0,
+        "minimum_floor": 20.0,
     },
     "schedule": {
         "days_of_week": [0, 1, 2, 3, 4, 5, 6],   # 0 = Monday (datetime.weekday())
@@ -245,9 +320,20 @@ def normalise(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     # --- discovery
     src = raw.get("discovery") if isinstance(raw.get("discovery"), dict) else {}
     d = cfg["discovery"]
-    strategies = _as_str_list(src.get("strategies"), default=d["strategies"],
+    raw_lanes = src.get("lanes")
+    if raw_lanes is None and src.get("strategies") is not None:
+        # A settings document written before lanes existed: map each legacy
+        # strategy onto its lane so the operator's existing choice keeps
+        # meaning it once had, rather than silently reverting to defaults.
+        legacy = _as_str_list(src.get("strategies"), default=[],
                               max_items=len(DISCOVERY_STRATEGIES), lower=True)
-    d["strategies"] = [s for s in strategies if s in DISCOVERY_STRATEGIES] or ["most_popular"]
+        raw_lanes = [_LEGACY_STRATEGY_TO_LANE[s] for s in legacy if s in _LEGACY_STRATEGY_TO_LANE]
+    lanes_in = [str(item).strip().upper() for item in raw_lanes] if isinstance(
+        raw_lanes, (list, tuple)) else list(d["lanes"])
+    lanes = [lane for i, lane in enumerate(lanes_in) if lane in LANES and lane not in lanes_in[:i]]
+    d["lanes"] = lanes[:len(LANES)] or [LANE_TRENDING_NOW]
+    mode = str(src.get("discovery_mode") or d["discovery_mode"]).strip().upper()
+    d["discovery_mode"] = mode if mode in DISCOVERY_MODES else DISCOVERY_MODE_BALANCED
     region = str(src.get("region_code") or d["region_code"]).strip().upper()
     if not re.match(r"^[A-Z]{2}$", region):
         raise ConfigError("region_code must be a 2-letter ISO country code")
@@ -258,19 +344,30 @@ def normalise(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     d["relevance_language"] = lang
     d["category_ids"] = [c for c in _as_str_list(src.get("category_ids"), default=[], max_items=20)
                          if c.isdigit()]
-    d["topics"] = _as_str_list(src.get("topics"), default=[], max_items=25, max_len=80)
+    d["topics"] = _as_str_list(src.get("topics"), default=list(DEFAULT_TOPICS),
+                               max_items=25, max_len=80)
     d["max_candidates_per_run"] = _as_int(src.get("max_candidates_per_run"), default=50,
                                           lo=5, hi=200, field="discovery.max_candidates_per_run")
+    d["lanes_per_run"] = _as_int(src.get("lanes_per_run"), default=3, lo=1, hi=len(LANES),
+                                 field="discovery.lanes_per_run")
+    d["query_variants_per_topic"] = _as_int(src.get("query_variants_per_topic"), default=2,
+                                            lo=1, hi=5, field="discovery.query_variants_per_topic")
+    d["exploration_rate"] = _as_float(src.get("exploration_rate"), default=0.15, lo=0.0, hi=1.0,
+                                      field="discovery.exploration_rate")
+    d["semantic_shortlist_size"] = _as_int(src.get("semantic_shortlist_size"), default=8,
+                                           lo=0, hi=30, field="discovery.semantic_shortlist_size")
     d["channel_allowlist"] = _as_str_list(src.get("channel_allowlist"), default=[], max_items=200)
     d["channel_denylist"] = _as_str_list(src.get("channel_denylist"), default=[], max_items=200)
-    # `creative_commons_search_only` was removed in this pass: it could
+    # `creative_commons_search_only` was removed in an earlier pass: it could
     # contradict rights.policy (an owned-channels policy plus a stale CC-only
     # search flag hid the operator's own standard-licence videos). The search
-    # filter is now derived from the policy — see
+    # filter is derived from the policy — see
     # eligibility.search_requires_creative_commons. Old values are dropped
     # silently by normalise(), which keeps every other setting intact.
-    if "niche_search" in d["strategies"] and not d["topics"]:
-        raise ConfigError("The niche search strategy needs at least one topic/keyword")
+    if any(lane in SEARCH_LANES_REQUIRING_TOPICS for lane in d["lanes"]) and not d["topics"]:
+        raise ConfigError(
+            "At least one enabled discovery lane searches by topic and needs "
+            "one or more configured topics/keywords")
 
     # --- eligibility
     src = raw.get("eligibility") if isinstance(raw.get("eligibility"), dict) else {}
@@ -326,6 +423,19 @@ def normalise(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "penalties": _normalise_weights(src.get("penalties"), DEFAULT_PENALTIES,
                                         "ranking.penalties"),
     }
+
+    # --- selection (adaptive tiers) ------------------------------------------
+    src = raw.get("selection") if isinstance(raw.get("selection"), dict) else {}
+    sel = cfg["selection"]
+    sel["strict_floor"] = _as_float(src.get("strict_floor"), default=70.0, lo=0.0, hi=100.0,
+                                    field="selection.strict_floor")
+    sel["normal_floor"] = _as_float(src.get("normal_floor"), default=45.0, lo=0.0, hi=100.0,
+                                    field="selection.normal_floor")
+    sel["minimum_floor"] = _as_float(src.get("minimum_floor"), default=20.0, lo=0.0, hi=100.0,
+                                     field="selection.minimum_floor")
+    if not (sel["minimum_floor"] <= sel["normal_floor"] <= sel["strict_floor"]):
+        raise ConfigError(
+            "selection floors must satisfy minimum_floor <= normal_floor <= strict_floor")
 
     # --- schedule
     src = raw.get("schedule") if isinstance(raw.get("schedule"), dict) else {}

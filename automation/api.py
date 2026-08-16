@@ -118,6 +118,16 @@ async def discover_now():
     return await _service().run_discovery_now()
 
 
+@router.post("/discover/dry-run")
+async def discover_dry_run():
+    """Discover, score and preview the next pick — never submits or publishes.
+
+    Safe to call before leaving Autopilot unattended: shows exactly what a
+    real cycle would do right now without doing it.
+    """
+    return await _service().discover_dry_run()
+
+
 @router.post("/process-next")
 async def process_next():
     return await _service().process_next_now()

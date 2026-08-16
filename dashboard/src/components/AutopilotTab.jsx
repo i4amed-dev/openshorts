@@ -107,6 +107,16 @@ export default function AutopilotTab() {
         }
     };
 
+    const runDryRun = async () => {
+        setBusy(true);
+        try {
+            return await apiJson('/api/autopilot/discover/dry-run', { method: 'POST' });
+        } finally {
+            setBusy(false);
+            await refresh();
+        }
+    };
+
     const saveSettings = async (draft) => {
         setSaving(true);
         setError('');
@@ -229,6 +239,7 @@ export default function AutopilotTab() {
                     busy={busy}
                     action={action}
                     onOpenSetup={() => { setView('setup'); loadSettings(); }}
+                    onDryRun={runDryRun}
                 />
             )}
             {view === 'setup' && (

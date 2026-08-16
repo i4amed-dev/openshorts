@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from automation.ports import ClipGeneratorPort, JobSnapshot, PublisherPort
-from automation.youtube_client import VideoRecord
+from automation.youtube_client import ChannelRecord, VideoRecord
 
 
 def run_async(coro):
@@ -248,11 +248,14 @@ class FakeYouTubeClient:
     """Returns a scripted candidate set; counts calls so quota use is assertable."""
 
     def __init__(self, records: Optional[List[VideoRecord]] = None, *,
-                 raise_on_popular: Optional[Exception] = None):
+                 raise_on_popular: Optional[Exception] = None,
+                 channel_records: Optional[List[ChannelRecord]] = None):
         self.records = records or []
         self.raise_on_popular = raise_on_popular
         self.popular_calls = 0
         self.search_calls = 0
+        self.channels_calls = 0
+        self.channel_records = channel_records or []
         self.configured = True
 
     async def __aenter__(self):
@@ -278,6 +281,11 @@ class FakeYouTubeClient:
         wanted = set(ids)
         return [r for r in self.records if r.video_id in wanted]
 
+    async def channels(self, channel_ids, **kwargs) -> List[ChannelRecord]:
+        self.channels_calls += 1
+        wanted = set(channel_ids)
+        return [c for c in self.channel_records if c.channel_id in wanted]
+
 
 def base_config(**overrides) -> Dict[str, Any]:
     """Normalised settings with the knobs a test usually wants to move."""
@@ -285,7 +293,11 @@ def base_config(**overrides) -> Dict[str, Any]:
     config = {
         "enabled": True,
         "timezone": "Europe/Madrid",
-        "discovery": {"strategies": ["most_popular"], "region_code": "US"},
+        # exploration_rate=0: deterministic "best score wins" is what most
+        # pipeline/service tests assert on. Tests specifically about
+        # exploration override this themselves (see test_autopilot_diversity.py).
+        "discovery": {"strategies": ["most_popular"], "region_code": "US",
+                      "exploration_rate": 0.0},
         "eligibility": {"min_views": 1000, "min_view_velocity_per_hour": 1,
                         "min_engagement_rate": 0.0, "channel_cooldown_hours": 0},
         "rights": {"policy": "CREATIVE_COMMONS_ONLY"},

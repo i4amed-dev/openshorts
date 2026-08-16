@@ -173,7 +173,10 @@ class TestQuotaBucketsInDiscovery:
                                                    run_id="run-1", now=NOW))
         assert not result.get("quota_exhausted")
         assert client.popular_calls == 0
-        assert client.search_calls == 1
+        # query expansion may issue more than one search.list call per topic —
+        # the point of this test is that the SEARCH bucket ran at all while
+        # GENERAL stayed blocked, not the exact call count.
+        assert client.search_calls >= 1
 
     def test_discovery_parks_only_when_nothing_can_run(self, db):
         db.mark_quota_exhausted(NOW + timedelta(hours=5), "quotaExceeded",

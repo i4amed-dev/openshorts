@@ -1,11 +1,16 @@
-"""Ranking: the "why did it choose that one" tests.
+"""Ranking invariants that hold regardless of the exact scoring formula.
 
-The whole reason this module is deterministic code and not an LLM call is that
-its output has to be reproducible and explainable. These tests pin the two
-properties that make it so: identical input gives identical order, and no single
-raw count can dominate the score.
+Formula-specific behaviour (which signal wins, age-cohort fairness, tiny-
+sample smoothing, channel outperformance...) lives in
+``test_autopilot_opportunity.py`` next to the module that implements it. This
+file pins the properties any reasonable scoring system must have: identical
+input gives identical order, every component stays in range, a lone
+candidate is not pinned to an extreme, and the per-channel penalty is capped.
+It also imports from ``automation.ranking`` deliberately, not
+``automation.opportunity`` — that import path is a compatibility shim and
+this file is what proves it still works.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from automation.ranking import duration_fit, relevance_score, score_candidates
 from autopilot_fakes import base_config, make_record
@@ -18,24 +23,6 @@ def _score_map(results):
 
 
 class TestNormalisation:
-    def test_a_single_giant_view_count_does_not_win_on_its_own(self):
-        """The failure mode this module exists to prevent.
-
-        An old video with 50M lifetime views and no current momentum must lose
-        to a fresh one climbing fast. Un-normalised summation gets this wrong
-        every time, because 50,000,000 dwarfs every other term.
-        """
-        config = base_config()
-        stale_giant = make_record(
-            "vid00000001", view_count=50_000_000, like_count=100_000,
-            comment_count=5_000, published_at=NOW - timedelta(days=150), now=NOW)
-        fresh_climber = make_record(
-            "vid00000002", view_count=400_000, like_count=40_000,
-            comment_count=6_000, published_at=NOW - timedelta(hours=8), now=NOW)
-
-        scores = _score_map(score_candidates([stale_giant, fresh_climber], config, now=NOW))
-        assert scores["vid00000002"] > scores["vid00000001"]
-
     def test_every_component_lands_between_zero_and_one(self):
         config = base_config()
         records = [make_record(f"vid0000000{i}", view_count=10 ** (i + 2), now=NOW)
@@ -77,23 +64,7 @@ class TestDeterminism:
         assert order == ["vid00000001", "vid00000002"]
 
 
-class TestSignals:
-    def test_engagement_lifts_an_otherwise_equal_video(self):
-        config = base_config()
-        dull = make_record("vid00000001", view_count=100_000, like_count=100,
-                           comment_count=5, now=NOW)
-        lively = make_record("vid00000002", view_count=100_000, like_count=20_000,
-                             comment_count=3_000, now=NOW)
-        scores = _score_map(score_candidates([dull, lively], config, now=NOW))
-        assert scores["vid00000002"] > scores["vid00000001"]
-
-    def test_chart_position_counts_when_everything_else_matches(self):
-        config = base_config()
-        top = make_record("vid00000001", chart_rank=1, now=NOW)
-        bottom = make_record("vid00000002", chart_rank=50, now=NOW)
-        scores = _score_map(score_candidates([top, bottom], config, now=NOW))
-        assert scores["vid00000001"] > scores["vid00000002"]
-
+class TestChannelPenalty:
     def test_channel_repetition_is_penalised(self):
         config = base_config()
         a = make_record("vid00000001", channel_id="UCoveruser", now=NOW)
@@ -111,22 +82,6 @@ class TestSignals:
         capped = score_candidates([record], config, now=NOW,
                                   channel_use_counts={"UCa": 3})[0][1]
         assert heavy == capped
-
-    def test_weights_are_configurable(self):
-        record_a = make_record("vid00000001", view_count=10_000_000,
-                               like_count=1, comment_count=1, now=NOW)
-        record_b = make_record("vid00000002", view_count=1_000,
-                               like_count=500, comment_count=400, now=NOW)
-        views_only = base_config(ranking={"weights": {
-            "velocity": 0, "views": 1, "engagement": 0, "comments": 0,
-            "recency": 0, "chart_rank": 0, "relevance": 0, "duration_fit": 0}})
-        engagement_only = base_config(ranking={"weights": {
-            "velocity": 0, "views": 0, "engagement": 1, "comments": 0,
-            "recency": 0, "chart_rank": 0, "relevance": 0, "duration_fit": 0}})
-        assert _score_map(score_candidates([record_a, record_b], views_only,
-                                           now=NOW))["vid00000001"] > 50
-        assert _score_map(score_candidates([record_a, record_b], engagement_only,
-                                           now=NOW))["vid00000002"] > 50
 
 
 class TestRelevance:
@@ -177,9 +132,8 @@ def test_breakdown_explains_the_score():
     _r, score, breakdown = score_candidates([record], config, now=NOW)[0]
     assert breakdown["score"] == score
     assert set(breakdown) >= {"components", "weights", "contributions", "penalties",
-                              "signals"}
+                              "signals", "age_cohort", "discovery_lane"}
     assert breakdown["signals"]["views"] == record.view_count
-    assert breakdown["signals"]["views_per_hour"] > 0
 
 
 def test_an_empty_candidate_set_is_not_an_error():

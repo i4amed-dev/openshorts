@@ -40,6 +40,33 @@ const CATEGORIES = [
     ['28', 'Science & Technology'],
 ];
 
+// Discovery lanes — see automation/config.py's LANES. Each targets a
+// different kind of opportunity; a pool built from only one lane is
+// structurally biased toward one kind of Short.
+const LANES = [
+    { value: 'TRENDING_NOW', label: 'trending now', hint: 'the chart — cheap, ~free' },
+    { value: 'EARLY_BREAKOUT', label: 'early breakout', hint: 'brand new, gaining fast' },
+    { value: 'NICHE_MOMENTUM', label: 'niche momentum', hint: 'biggest in your topics recently' },
+    { value: 'EVERGREEN_WINNERS', label: 'evergreen winners', hint: 'proven demand, any age' },
+    { value: 'UNDEREXPOSED', label: 'underexposed', hint: 'high engagement, low reach' },
+    { value: 'CHANNEL_WINNERS', label: 'channel winners', hint: 'channels that already worked' },
+];
+const TOPIC_LANES = new Set(['EARLY_BREAKOUT', 'NICHE_MOMENTUM', 'EVERGREEN_WINNERS',
+    'UNDEREXPOSED']);
+
+const DISCOVERY_MODES = [
+    { value: 'BALANCED', label: 'balanced',
+        blurb: 'An even mix across trending, niche, evergreen and underexposed opportunities.' },
+    { value: 'TREND_HEAVY', label: 'trend-heavy',
+        blurb: 'Leans toward what is popular or breaking out right now.' },
+    { value: 'EVERGREEN_HEAVY', label: 'evergreen-heavy',
+        blurb: 'Leans toward proven, timeless sources over fresh momentum.' },
+    { value: 'NICHE_FOCUSED', label: 'niche-focused',
+        blurb: 'Leans on your configured topics over general trending.' },
+    { value: 'EXPERIMENTAL', label: 'experimental',
+        blurb: 'More exploration — deliberately tries lower-ranked and underexposed picks.' },
+];
+
 const RIGHTS_POLICIES = [
     {
         value: 'CREATIVE_COMMONS_ONLY',
@@ -197,7 +224,7 @@ export default function AutopilotSetup({ settings, onSave, saving, error, onDone
     };
 
     const needsChannels = draft.rights.policy !== 'CREATIVE_COMMONS_ONLY';
-    const usesNiche = draft.discovery.strategies.includes('niche_search');
+    const usesTopics = (draft.discovery.lanes || []).some((l) => TOPIC_LANES.has(l));
     const selectedProfile = (profiles || []).find(
         (p) => p.username === draft.publishing.upload_post_user);
     const connected = selectedProfile ? (selectedProfile.connected || []) : null;
@@ -272,20 +299,50 @@ export default function AutopilotSetup({ settings, onSave, saving, error, onDone
             <section className="card p-5">
                 <h3 className="text-sm text-ink lowercase mb-4">what to look for</h3>
 
-                <Field label="strategy">
+                <Field
+                    label="discovery mode"
+                    hint="A starting point for the lane rotation below — pick a lane mix
+                          yourself any time under Advanced."
+                >
+                    <div className="grid sm:grid-cols-2 gap-2">
+                        {DISCOVERY_MODES.map((option) => (
+                            <button
+                                key={option.value}
+                                type="button"
+                                onClick={() => set('discovery.discovery_mode', option.value)}
+                                className={`text-left p-2.5 rounded-input border transition-colors ${
+                                    draft.discovery.discovery_mode === option.value
+                                        ? 'border-brass bg-paper3'
+                                        : 'border-rule hover:border-rule2'}`}
+                            >
+                                <span className={`text-xs ${
+                                    draft.discovery.discovery_mode === option.value
+                                        ? 'text-ink' : 'text-ink2'}`}>
+                                    {option.label}
+                                </span>
+                                <p className="text-xs text-muted mt-0.5 leading-relaxed">
+                                    {option.blurb}
+                                </p>
+                            </button>
+                        ))}
+                    </div>
+                </Field>
+
+                <Field
+                    label="discovery lanes"
+                    hint="Six independent ways of finding candidates — trending, breakout,
+                          niche, evergreen, underexposed, and channels that already worked.
+                          Age never disqualifies a source; these just decide where to look."
+                >
                     <SegmentedControl
                         multi
-                        options={[
-                            { value: 'most_popular', label: 'trending', hint: '1 quota unit' },
-                            { value: 'niche_search', label: 'my topics', hint: '100 units each' },
-                        ]}
-                        value={draft.discovery.strategies}
-                        onChange={(v) => set('discovery.strategies',
-                            v.length ? v : ['most_popular'])}
+                        options={LANES}
+                        value={draft.discovery.lanes}
+                        onChange={(v) => set('discovery.lanes', v.length ? v : ['TRENDING_NOW'])}
                     />
                 </Field>
 
-                {usesNiche && (
+                {usesTopics && (
                     <Field
                         label="topics / keywords"
                         hint="One per line. Each topic costs 100 YouTube quota units per discovery
@@ -588,7 +645,12 @@ export default function AutopilotSetup({ settings, onSave, saving, error, onDone
                 {advanced && (
                     <div className="mt-5 space-y-6 animate-fade">
                         <div>
-                            <p className="eyebrow mb-3">source filters</p>
+                            <p className="eyebrow mb-1">source filters</p>
+                            <p className="text-xs text-muted mb-3 leading-relaxed">
+                                None of these reject a candidate outright any more — a source
+                                outside these numbers just scores lower, it is never invisible.
+                                Only rights, availability and format (below) are hard blocks.
+                            </p>
                             <div className="grid sm:grid-cols-2 gap-x-4">
                                 <Field label="min source length">
                                     <Num value={draft.eligibility.min_duration_seconds}
@@ -600,35 +662,46 @@ export default function AutopilotSetup({ settings, onSave, saving, error, onDone
                                         min={60} max={36000} suffix="s"
                                         onChange={(v) => set('eligibility.max_duration_seconds', v)} />
                                 </Field>
-                                <Field label="max age">
+                                <Field label="typical age window"
+                                    hint="Shapes scoring cohorts, not a cutoff — an evergreen
+                                          source far outside this window can still win on
+                                          proven demand.">
                                     <Num value={draft.eligibility.max_age_hours}
                                         min={1} max={8760} suffix="h"
                                         onChange={(v) => set('eligibility.max_age_hours', v)} />
                                 </Field>
-                                <Field label="min views">
+                                <Field label="typical view count"
+                                    hint="A reference point for scoring, not a floor.">
                                     <Num value={draft.eligibility.min_views} min={0}
                                         onChange={(v) => set('eligibility.min_views', v)} />
                                 </Field>
-                                <Field label="min views / hour">
+                                <Field label="typical views / hour"
+                                    hint="A reference point for scoring, not a floor.">
                                     <Num value={draft.eligibility.min_view_velocity_per_hour}
                                         min={0} step={10}
                                         onChange={(v) => set(
                                             'eligibility.min_view_velocity_per_hour', v)} />
                                 </Field>
-                                <Field label="min engagement rate"
-                                    hint="(likes + comments) ÷ views. 0.005 = 0.5%.">
+                                <Field label="typical engagement rate"
+                                    hint="(likes + comments) ÷ views. 0.005 = 0.5%. Also sets
+                                          the smoothing prior so tiny-sample videos can't game
+                                          the ratio.">
                                     <Num value={draft.eligibility.min_engagement_rate}
                                         min={0} max={1} step={0.001}
                                         onChange={(v) => set('eligibility.min_engagement_rate', v)} />
                                 </Field>
                                 <Field label="channel cooldown"
-                                    hint="Don't reuse the same channel within this window.">
+                                    hint="Soft penalty + selection-time deferral, not a hard
+                                          block — a great source from a recently-used channel
+                                          is never simply dropped.">
                                     <Num value={draft.eligibility.channel_cooldown_hours}
                                         min={0} max={8760} suffix="h"
                                         onChange={(v) => set(
                                             'eligibility.channel_cooldown_hours', v)} />
                                 </Field>
-                                <Field label="minimum source quality">
+                                <Field label="minimum source quality"
+                                    hint="A true hard floor — probed from the actual file at
+                                          selection time, not the YouTube-reported definition.">
                                     <Num value={draft.processing.min_source_height}
                                         min={0} max={4320} suffix="p"
                                         onChange={(v) => set('processing.min_source_height', v)} />
@@ -684,6 +757,53 @@ export default function AutopilotSetup({ settings, onSave, saving, error, onDone
                                             onChange={(v) => set(`ranking.weights.${key}`, v)} />
                                     </Field>
                                 ))}
+                            </div>
+                        </div>
+
+                        <div>
+                            <p className="eyebrow mb-1">adaptive selection</p>
+                            <p className="text-xs text-muted mb-3 leading-relaxed">
+                                Three passes over the candidate queue, each relaxing how good the
+                                opportunity score must be. Rights and technical validity never
+                                relax — only these floors do, so a healthy discovery run always
+                                has somewhere to land instead of ending empty.
+                            </p>
+                            <div className="grid sm:grid-cols-2 gap-x-4">
+                                <Field label="strict floor" hint="Try for this score first.">
+                                    <Num value={draft.selection.strict_floor} min={0} max={100}
+                                        onChange={(v) => set('selection.strict_floor', v)} />
+                                </Field>
+                                <Field label="normal floor" hint="Relax to this if nothing clears strict.">
+                                    <Num value={draft.selection.normal_floor} min={0} max={100}
+                                        onChange={(v) => set('selection.normal_floor', v)} />
+                                </Field>
+                                <Field label="exploration floor"
+                                    hint="The true minimum — below this, nothing is selected.">
+                                    <Num value={draft.selection.minimum_floor} min={0} max={100}
+                                        onChange={(v) => set('selection.minimum_floor', v)} />
+                                </Field>
+                                <Field label="exploration rate"
+                                    hint="Fraction of picks that deliberately try something other
+                                          than the top-ranked candidate, so Autopilot doesn't get
+                                          stuck exploiting one channel or lane.">
+                                    <Num value={draft.discovery.exploration_rate} min={0} max={1}
+                                        step={0.05}
+                                        onChange={(v) => set('discovery.exploration_rate', v)} />
+                                </Field>
+                                <Field label="semantic shortlist size"
+                                    hint="How many top candidates get an optional Gemini
+                                          refinement pass per run. 0 disables it. Cached forever
+                                          per video, so this rarely costs more than once each.">
+                                    <Num value={draft.discovery.semantic_shortlist_size}
+                                        min={0} max={30}
+                                        onChange={(v) => set('discovery.semantic_shortlist_size', v)} />
+                                </Field>
+                                <Field label="lanes per discovery run"
+                                    hint="How many search-based lanes run in one cycle, rotating
+                                          across runs so quota is spent breadth-first.">
+                                    <Num value={draft.discovery.lanes_per_run} min={1} max={6}
+                                        onChange={(v) => set('discovery.lanes_per_run', v)} />
+                                </Field>
                             </div>
                         </div>
 

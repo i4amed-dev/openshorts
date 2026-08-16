@@ -27,7 +27,7 @@ from .models import (
     SourceState, assert_publish_transition, assert_transition,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # The DB lives beside the job output on the persistent volume, never in the
 # ephemeral container layer. AUTOPILOT_DB_PATH overrides it for tests/ops.
@@ -110,7 +110,16 @@ CREATE TABLE IF NOT EXISTS discovered_source (
     attempts          INTEGER NOT NULL DEFAULT 0,
     last_error        TEXT,
     rights_policy     TEXT,
-    next_retry_at     TEXT
+    next_retry_at     TEXT,
+    -- v3: opportunity-scoring metadata (see automation/opportunity.py). Split
+    -- out from `eligible`/`rejection_reason` so a candidate can show a high
+    -- score AND a rights block at the same time instead of one flag hiding
+    -- the other — see automation/eligibility.py's module docstring.
+    discovery_lane     TEXT,
+    age_cohort         TEXT,
+    selection_tier     TEXT,
+    technical_eligible INTEGER NOT NULL DEFAULT 1,
+    policy_eligible    INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS ix_source_state ON discovered_source (state, score DESC);
 CREATE INDEX IF NOT EXISTS ix_source_channel ON discovered_source (channel_id, selected_at);
@@ -226,6 +235,29 @@ CREATE TABLE IF NOT EXISTS api_quota (
     updated_at   TEXT NOT NULL,
     PRIMARY KEY (provider, bucket)
 );
+
+-- v3: cheap per-channel baseline for channel_outperformance (see
+-- automation/channel_context.py). TTL'd in application code, not here — a
+-- stale-but-present row is preferable to a synchronous API call on every
+-- candidate.
+CREATE TABLE IF NOT EXISTS channel_stats_cache (
+    channel_id       TEXT PRIMARY KEY,
+    subscriber_count INTEGER,
+    view_count       INTEGER,
+    video_count      INTEGER,
+    fetched_at       TEXT NOT NULL
+);
+
+-- v3: optional Gemini shortlist evaluation (see automation/ports.py's
+-- SemanticEvaluatorPort), cached forever per (video, model_version) so an
+-- evergreen source that resurfaces across runs is never re-scored.
+CREATE TABLE IF NOT EXISTS semantic_evaluation (
+    youtube_video_id TEXT NOT NULL,
+    model_version    TEXT NOT NULL,
+    result_json      TEXT NOT NULL,
+    evaluated_at      TEXT NOT NULL,
+    PRIMARY KEY (youtube_video_id, model_version)
+);
 """
 
 
@@ -326,7 +358,13 @@ class AutopilotDB:
 
         if version < 2:
             self._migrate_v1_to_v2(conn)
+            version = 2
             conn.execute("PRAGMA user_version = 2")
+
+        if version < 3:
+            self._migrate_v2_to_v3(conn)
+            version = 3
+            conn.execute("PRAGMA user_version = 3")
 
         # Idempotent tail: creates anything additive the running version added
         # (new tables/indexes) without touching existing data.
@@ -408,6 +446,37 @@ class AutopilotDB:
                     SELECT provider, 'general', day, units_used, exhausted_until, last_error,
                            updated_at FROM api_quota_v1""")
                 conn.execute("DROP TABLE api_quota_v1")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
+
+    def _migrate_v2_to_v3(self, conn: sqlite3.Connection) -> None:
+        """v2 → v3: opportunity-scoring metadata columns.
+
+        Age/views/velocity/engagement stopped being hard eligibility gates in
+        this version (see eligibility.py) — the new columns let the dashboard
+        show *why* a candidate scored the way it did (lane, age cohort,
+        selection tier) and let rights-blocked candidates keep a visible
+        opportunity score instead of the old single `eligible` flag
+        conflating "good candidate" with "allowed to process". New tables
+        (channel_stats_cache, semantic_evaluation) are created by the
+        idempotent _SCHEMA tail that runs right after this, so nothing to do
+        for those here — only existing-table column adds need explicit DDL.
+        """
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(discovered_source)")}
+            for column, ddl in (
+                ("discovery_lane", "TEXT"),
+                ("age_cohort", "TEXT"),
+                ("selection_tier", "TEXT"),
+                ("technical_eligible", "INTEGER NOT NULL DEFAULT 1"),
+                ("policy_eligible", "INTEGER NOT NULL DEFAULT 1"),
+            ):
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE discovered_source ADD COLUMN {column} {ddl}")
         except BaseException:
             conn.execute("ROLLBACK")
             raise
@@ -614,8 +683,9 @@ class AutopilotDB:
                 " comment_count, license, definition, caption_available, live_state,"
                 " made_for_kids, age_restricted, privacy_status, embeddable,"
                 " discovery_source, discovered_at, chart_rank, run_id, score,"
-                " score_breakdown, eligible, rejection_reason, state, state_changed_at"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " score_breakdown, eligible, rejection_reason, state, state_changed_at,"
+                " discovery_lane, age_cohort, technical_eligible, policy_eligible"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (source.youtube_video_id, source.watch_url, source.channel_id,
                  source.channel_title, source.title, source.description[:2000],
                  source.published_at, source.duration_seconds, source.category_id,
@@ -625,7 +695,9 @@ class AutopilotDB:
                  source.privacy_status, int(source.embeddable), source.discovery_source,
                  now, source.chart_rank, source.run_id, source.score,
                  json.dumps(source.score_breakdown), int(source.eligible),
-                 source.rejection_reason, SourceState.DISCOVERED, now))
+                 source.rejection_reason, SourceState.DISCOVERED, now,
+                 source.discovery_lane, source.age_cohort,
+                 int(source.technical_eligible), int(source.policy_eligible)))
             return int(cur.lastrowid), True
 
     def get_source(self, source_id: int) -> Optional[DiscoveredSource]:
@@ -655,11 +727,20 @@ class AutopilotDB:
         return [_row_to_source(row) for row in self.query(sql, params)]
 
     def set_source_score(self, source_id: int, score: float, breakdown: Dict[str, Any],
-                         eligible: bool, rejection_reason: Optional[str]) -> None:
+                         eligible: bool, rejection_reason: Optional[str], *,
+                         discovery_lane: Optional[str] = None, age_cohort: Optional[str] = None,
+                         technical_eligible: Optional[bool] = None,
+                         policy_eligible: Optional[bool] = None) -> None:
         self.execute(
             "UPDATE discovered_source SET score = ?, score_breakdown = ?, eligible = ?, "
-            "rejection_reason = ? WHERE id = ?",
-            (float(score), json.dumps(breakdown), int(eligible), rejection_reason, source_id))
+            "rejection_reason = ?, discovery_lane = COALESCE(?, discovery_lane), "
+            "age_cohort = COALESCE(?, age_cohort), "
+            "technical_eligible = COALESCE(?, technical_eligible), "
+            "policy_eligible = COALESCE(?, policy_eligible) WHERE id = ?",
+            (float(score), json.dumps(breakdown), int(eligible), rejection_reason,
+             discovery_lane, age_cohort,
+             None if technical_eligible is None else int(technical_eligible),
+             None if policy_eligible is None else int(policy_eligible), source_id))
 
     def transition_source(self, source_id: int, target: str, *,
                           expected: Optional[Iterable[str]] = None, **fields) -> bool:
@@ -670,7 +751,8 @@ class AutopilotDB:
         This compare-and-set is what makes overlapping ticks harmless.
         """
         allowed_fields = {"job_id", "selected_at", "attempts", "last_error", "rights_policy",
-                          "next_retry_at", "rejection_reason", "eligible", "score"}
+                          "next_retry_at", "rejection_reason", "eligible", "score",
+                          "selection_tier"}
         now = iso(utcnow())
         with self.tx() as conn:
             row = conn.execute("SELECT state FROM discovered_source WHERE id = ?",
@@ -720,6 +802,19 @@ class AutopilotDB:
             "SELECT MAX(selected_at) AS last FROM discovered_source "
             "WHERE channel_id = ? AND selected_at IS NOT NULL", (channel_id,))
         return parse_iso(row["last"]) if row and row["last"] else None
+
+    def top_channels(self, limit: int = 5) -> List[str]:
+        """Channels whose best-known candidate scored highest — seeds for the
+        CHANNEL_WINNERS discovery lane. Not "channels we selected from before"
+        (that is channel_use_count); this is "channels that have produced a
+        good-looking candidate at all", so a promising channel can be revisited
+        even before Autopilot has ever picked from it.
+        """
+        rows = self.query(
+            "SELECT channel_id, MAX(score) AS best FROM discovered_source "
+            "WHERE channel_id != '' GROUP BY channel_id ORDER BY best DESC LIMIT ?",
+            (max(0, int(limit)),))
+        return [row["channel_id"] for row in rows]
 
     def channel_use_count(self, channel_id: str) -> int:
         row = self.query_one(
@@ -1097,6 +1192,54 @@ class AutopilotDB:
             self.clear_quota_block(provider, bucket)
         return None
 
+    # --- channel context (automation/channel_context.py) ----------------------
+
+    def get_channel_stats(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        row = self.query_one("SELECT * FROM channel_stats_cache WHERE channel_id = ?",
+                             (channel_id,))
+        return dict(row) if row else None
+
+    def get_channel_stats_bulk(self, channel_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+        ids = [c for c in dict.fromkeys(channel_ids) if c]
+        out: Dict[str, Dict[str, Any]] = {}
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            if not chunk:
+                continue
+            rows = self.query(
+                f"SELECT * FROM channel_stats_cache WHERE channel_id IN "
+                f"({','.join('?' * len(chunk))})", chunk)
+            out.update({row["channel_id"]: dict(row) for row in rows})
+        return out
+
+    def save_channel_stats(self, channel_id: str, *, subscriber_count: Optional[int],
+                           view_count: Optional[int], video_count: Optional[int]) -> None:
+        self.execute(
+            "INSERT INTO channel_stats_cache "
+            "(channel_id, subscriber_count, view_count, video_count, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(channel_id) DO UPDATE SET subscriber_count = excluded.subscriber_count,"
+            " view_count = excluded.view_count, video_count = excluded.video_count,"
+            " fetched_at = excluded.fetched_at",
+            (channel_id, subscriber_count, view_count, video_count, iso(utcnow())))
+
+    # --- semantic evaluation cache (automation/ports.py SemanticEvaluatorPort) -
+
+    def get_semantic_evaluation(self, video_id: str, model_version: str) -> Optional[Dict[str, Any]]:
+        row = self.query_one(
+            "SELECT result_json FROM semantic_evaluation "
+            "WHERE youtube_video_id = ? AND model_version = ?", (video_id, model_version))
+        return _json_loads(row["result_json"], None) if row else None
+
+    def save_semantic_evaluation(self, video_id: str, model_version: str,
+                                 result: Dict[str, Any]) -> None:
+        self.execute(
+            "INSERT INTO semantic_evaluation "
+            "(youtube_video_id, model_version, result_json, evaluated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(youtube_video_id, model_version) DO UPDATE SET "
+            " result_json = excluded.result_json, evaluated_at = excluded.evaluated_at",
+            (video_id, model_version, json.dumps(result), iso(utcnow())))
+
 
 # --- row mappers --------------------------------------------------------------
 
@@ -1119,6 +1262,13 @@ def _row_to_source(row: sqlite3.Row) -> DiscoveredSource:
         selected_at=row["selected_at"], job_id=row["job_id"], attempts=row["attempts"],
         last_error=row["last_error"], rights_policy=row["rights_policy"],
         next_retry_at=row["next_retry_at"],
+        discovery_lane=_column(row, "discovery_lane"),
+        age_cohort=_column(row, "age_cohort"),
+        selection_tier=_column(row, "selection_tier"),
+        technical_eligible=bool(_column(row, "technical_eligible")
+                                if _column(row, "technical_eligible") is not None else True),
+        policy_eligible=bool(_column(row, "policy_eligible")
+                             if _column(row, "policy_eligible") is not None else True),
     )
 
 
