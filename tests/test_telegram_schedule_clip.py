@@ -118,7 +118,10 @@ class TestFullFlow:
         clip = _pending_clip(service)
         update, context = _update(), FakeContext()
         run_async(publishing.new(update, context, clip.id))
-        context.user_data[publishing.SCHEDULE_KEY]["day_token"] = "today"
+        # "tomorrow" (not "today") deliberately: _resolve_day/schedule_clip use
+        # the real wall clock, not the fixture's frozen NOW, so a fixed
+        # "today at 16:30" would flake depending on what time the suite runs.
+        context.user_data[publishing.SCHEDULE_KEY]["day_token"] = "tomorrow"
         context.user_data[publishing.SCHEDULE_KEY]["hhmm"] = "16:30"
         run_async(publishing.sched_confirm(update, context))
 

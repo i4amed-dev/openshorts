@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Dict, List, Optional
 
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 log = logging.getLogger(__name__)
@@ -61,7 +62,9 @@ Handler = Callable[[Update, ContextTypes.DEFAULT_TYPE, Callback], Awaitable[None
 
 class Router:
     """One place callback routes are registered and dispatched from, so the
-    answer-once policy and unknown-callback handling can never be bypassed."""
+    answer-guarantee policy and unknown-callback handling can never be
+    bypassed — see dispatch()'s docstring for why it's "at least one answer,
+    tolerantly" rather than a strict "exactly once"."""
 
     def __init__(self) -> None:
         self._routes: Dict[str, Handler] = {}
@@ -72,32 +75,39 @@ class Router:
         self._routes[ns] = handler
 
     async def dispatch(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Route the callback, then guarantee the client's loading spinner
+        clears — regardless of whether the handler itself already answered.
+
+        `CallbackQuery` (like every PTB API object) is a `TelegramObject`,
+        which hard-blocks arbitrary attribute assignment — `query.answer = …`
+        raises `AttributeError` on a real object (it only worked against the
+        plain-object test fakes). So there is no way to *intercept* a
+        handler's own call to `.answer()` from the outside; instead this
+        always attempts one trailing answer in `finally`, and any failure —
+        including Telegram rejecting a harmless duplicate — is swallowed. A
+        handler that already answered simply gets one redundant, invisible
+        API call; a handler that forgot still leaves the user an answered UI.
+        """
         query = update.callback_query
         if query is None:
             return
 
-        answered = {"done": False}
-        real_answer = query.answer
+        cb = parse(query.data)
+        if cb is None or cb.ns not in self._routes:
+            await self._safe_answer(query, "This button has expired.")
+            return
 
-        async def guarded_answer(*args, **kwargs):
-            if answered["done"]:
-                return
-            answered["done"] = True
-            try:
-                await real_answer(*args, **kwargs)
-            except Exception as exc:
-                log.warning("callback answer failed: %s", exc)
-
-        query.answer = guarded_answer  # type: ignore[method-assign]
         try:
-            cb = parse(query.data)
-            if cb is None or cb.ns not in self._routes:
-                await query.answer("This button has expired.")
-                return
             await self._routes[cb.ns](update, context, cb)
         finally:
-            if not answered["done"]:
-                await query.answer()
+            await self._safe_answer(query)
+
+    @staticmethod
+    async def _safe_answer(query, *args, **kwargs) -> None:
+        try:
+            await query.answer(*args, **kwargs)
+        except TelegramError as exc:
+            log.warning("callback answer failed: %s", exc)
 
 
 router = Router()
